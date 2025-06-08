@@ -17,7 +17,7 @@ class PercentageStrategy(StrategyInterface):
         if df.empty:
             return self._hold_response(ticker, None)
 
-        recent_price = df['close'].iloc[-1]
+        recent_price = df['c'].iloc[-1]
         signal = "buy"  # This strategy assumes always-buy; refinement is possible
 
         stop_loss = recent_price * (1 - self.loss_pct)

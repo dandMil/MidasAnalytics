@@ -10,6 +10,9 @@ def n_days_ago(n: int) -> str:
 
 
 def get_price_history(ticker: str, days: int = 60) -> list[dict]:
+    POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+
+    print(f'POLYGON API {POLYGON_API_KEY}')
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{n_days_ago(days)}/{n_days_ago(0)}"
     params = {
         "adjusted": "true",
@@ -20,8 +23,7 @@ def get_price_history(ticker: str, days: int = 60) -> list[dict]:
     if response.status_code != 200:
         raise Exception(f"[Polygon] Failed to fetch price history: {response.text}")
 
-    data = response.json()
-    return data.get("results", [])
+    return response.json().get("results", [])
 
 
 def get_bars(ticker: str, start_days_ago: int = 30, end_days_ago: int = 0) -> list[dict]:
@@ -35,11 +37,14 @@ def get_bars(ticker: str, start_days_ago: int = 30, end_days_ago: int = 0) -> li
     if response.status_code != 200:
         raise Exception(f"[Polygon] Failed to fetch bars: {response.text}")
 
-    data = response.json()
-    return data.get("results", [])
+    return response.json().get("results", [])
 
 
 def get_top_movers(direction: str = "gainers") -> list[dict]:
+    POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+
+    print(f'POLYGON API {POLYGON_API_KEY}')
+
     assert direction in ["gainers", "losers"], "Direction must be 'gainers' or 'losers'"
     url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{direction}"
     params = {"apiKey": POLYGON_API_KEY}
@@ -48,8 +53,7 @@ def get_top_movers(direction: str = "gainers") -> list[dict]:
     if response.status_code != 200:
         raise Exception(f"[Polygon] Failed to fetch top movers: {response.text}")
 
-    data = response.json()
-    tickers = data.get("tickers", [])
+    tickers = response.json().get("tickers", [])
 
     return [
         {

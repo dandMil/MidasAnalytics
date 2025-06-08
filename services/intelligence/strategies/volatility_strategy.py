@@ -45,7 +45,7 @@ class VolatilityStrategy:
         df = df.copy()
         df['atr'] = df['high'].sub(df['low']).rolling(window=14).mean()
 
-        price = df['close'].iloc[-1]
+        price = df['c'].iloc[-1]
         atr = df['atr'].iloc[-1]
         stop_loss = round(price - self.atr_loss * atr, 2)
         take_profit = round(price + self.atr_profit * atr, 2)

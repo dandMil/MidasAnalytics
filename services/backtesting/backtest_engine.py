@@ -7,7 +7,8 @@ class BacktestEngine:
         print(f"[BacktestEngine] Backtesting {strategy.__class__.__name__} on {ticker} with {len(data)} bars")
 
         df = pd.DataFrame(data)
-        required_cols = {'open', 'high', 'low', 'close', 'volume'}
+        required_cols = {'o', 'h', 'l', 'c', 'v'}
+        print(f' DF HEAD: {df.head}')
         if not required_cols.issubset(df.columns.str.lower()):
             raise ValueError(f"Missing required OHLCV columns: {required_cols - set(df.columns)}")
 
@@ -34,7 +35,7 @@ class BacktestEngine:
 
         for i in range(20, len(df)):
             sub_df = df.iloc[:i + 1].copy()
-            price = df.iloc[i]['close']
+            price = df.iloc[i]['c']
 
             try:
                 result = strategy.apply(sub_df, ticker)
