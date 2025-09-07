@@ -1,0 +1,17 @@
+name: MidasAnalytics
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - flask
+  - pandas
+  - numpy
+  - python-dotenv
+  - pip
+  - pip:
+      - yfinance
+      - ta
+      - flask-cors
+      - openai
+      - praw

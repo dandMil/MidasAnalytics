@@ -2,3 +2,11 @@
 .DS_store
 .idea/
 *.iml
+# Python cache directories and compiled files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.pyc
