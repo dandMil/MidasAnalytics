@@ -25,8 +25,7 @@ def calculate_technical_indicators(ticker: str, asset_type: str = "stock"):
         ticker = f"X:{ticker.upper()}USD"
 
     try:
-        data = get_price_history(ticker, days=60)
-        bars = data.get("results", [])
+        bars = get_price_history(ticker, days=60)
         if not bars or len(bars) < 30:
             return {"error": "Not enough data."}
 
