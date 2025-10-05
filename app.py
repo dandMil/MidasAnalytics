@@ -295,3 +295,200 @@ async def sell_asset_endpoint(request: Request):
         return {"success": True, "message": f"Sold {shares} shares of {ticker}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/midas/asset/stock_screener")
+def get_stock_screener(
+    sector: str = "all",  # "tech", "bio", "finance", "energy", "all"
+    min_1m_performance: float = 10.0,
+    min_3m_performance: float = 20.0,
+    min_6m_performance: float = 30.0,
+    min_price: float = 1.0,
+    max_price: float = 50.0,
+    min_rsi: float = 0.0,
+    max_rsi: float = 100.0,
+    rsi_signal: str = "all",  # "all", "oversold", "overbought", "neutral"
+    limit: int = 50
+):
+    try:
+        from services.stock_screener_service import screen_stocks
+        
+        filters = {
+            "sector": sector,
+            "min_1m_performance": min_1m_performance,
+            "min_3m_performance": min_3m_performance,
+            "min_6m_performance": min_6m_performance,
+            "min_price": min_price,
+            "max_price": max_price,
+            "min_rsi": min_rsi,
+            "max_rsi": max_rsi,
+            "rsi_signal": rsi_signal,
+            "limit": limit
+        }
+        
+        results = screen_stocks(filters)
+        return results
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/midas/asset/available_sectors")
+def get_available_sectors():
+    try:
+        from services.stock_screener_service import get_available_sectors
+        sectors = get_available_sectors()
+        return sectors
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/midas/asset/universe_stats")
+def get_universe_stats():
+    try:
+        from services.ticker_universe_service import ticker_universe
+        stats = ticker_universe.get_universe_stats()
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/midas/asset/screener_info")
+def get_screener_info():
+    """Get information about the stock screener's universe and capabilities"""
+    try:
+        from services.ticker_universe_service import ticker_universe
+        from services.stock_screener_service import SECTOR_TICKERS
+        
+        # Get universe stats
+        universe_stats = ticker_universe.get_universe_stats()
+        
+        # Get available sectors
+        available_sectors = {}
+        for sector, tickers in SECTOR_TICKERS.items():
+            available_sectors[sector] = {
+                "name": sector.title(),
+                "ticker_count": len(tickers),
+                "sample_tickers": tickers[:5]  # Show first 5 as examples
+            }
+        
+        return {
+            "universe": {
+                "total_tickers": universe_stats.get("total_tickers", 0),
+                "exchanges": universe_stats.get("exchanges", {}),
+                "types": universe_stats.get("types", {}),
+                "last_updated": universe_stats.get("last_updated"),
+                "screener_limit": 2000,  # Current limit for performance
+                "coverage_percentage": round((2000 / universe_stats.get("total_tickers", 1)) * 100, 1)
+            },
+            "sectors": available_sectors,
+            "capabilities": {
+                "performance_filtering": True,
+                "price_range_filtering": True,
+                "rsi_filtering": True,
+                "technical_analysis": True,
+                "adr_sorting": True,
+                "signal_analysis": True
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/midas/asset/sector_summary/{sector}")
+def get_sector_summary(sector: str):
+    try:
+        from services.stock_screener_service import get_sector_performance_summary
+        summary = get_sector_performance_summary(sector)
+        return summary
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/midas/asset/shorts_squeeze")
+def get_shorts_squeeze():
+    try:
+        from services.reddit.reddit_scraper import RedditScraper
+        from services.technical_indicator_service import calculate_technical_indicators
+        import random
+        
+        # Use Reddit scraper to get mentioned tickers
+        scraper = RedditScraper(days_back=7)  # Look back 7 days
+        mentioned_tickers = scraper.scrape()
+        
+        # Limit to top 20 tickers to avoid too many API calls
+        top_tickers = mentioned_tickers[:20] if len(mentioned_tickers) > 20 else mentioned_tickers
+        
+        shorts_squeeze_data = []
+        
+        for ticker in top_tickers:
+            try:
+                # Get technical analysis for each ticker
+                tech_data = calculate_technical_indicators(ticker, "stock")
+                
+                # Skip if we got an error
+                if "error" in tech_data:
+                    continue
+                
+                # Calculate shorts squeeze potential based on technical indicators
+                rsi = tech_data.get("rsi", 50)
+                macd = tech_data.get("macd", 0)
+                macd_signal = tech_data.get("macd_signal", 0)
+                price_change = tech_data.get("price_rate_of_change", 0)
+                
+                # Simple shorts squeeze scoring
+                squeeze_score = 0
+                if rsi < 30:  # Oversold
+                    squeeze_score += 2
+                elif rsi > 70:  # Overbought
+                    squeeze_score -= 1
+                
+                if macd > macd_signal:  # Bullish MACD
+                    squeeze_score += 1
+                
+                if price_change > 0:  # Positive price change
+                    squeeze_score += 1
+                
+                # Determine squeeze signal
+                if squeeze_score >= 3:
+                    signal = "HIGH_SQUEEZE_POTENTIAL"
+                elif squeeze_score >= 2:
+                    signal = "MODERATE_SQUEEZE_POTENTIAL"
+                elif squeeze_score >= 1:
+                    signal = "LOW_SQUEEZE_POTENTIAL"
+                else:
+                    signal = "NEUTRAL"
+                
+                # Mock additional data that would come from a real shorts data provider
+                short_interest = random.uniform(5, 25)  # Mock short interest %
+                short_ratio = random.uniform(1, 5)  # Mock short ratio
+                days_to_cover = random.uniform(1, 10)  # Mock days to cover
+                
+                shorts_squeeze_data.append({
+                    "ticker": ticker,
+                    "market_price": tech_data.get("market_price", 0),
+                    "signal": signal,
+                    "macd": tech_data.get("macd", 0),
+                    "price_rate_of_change": tech_data.get("price_rate_of_change", 0),
+                    "rsi": tech_data.get("rsi", 50),
+                    "stochastic_oscillator": tech_data.get("stochastic_oscillator", 50),
+                    "industry": "Technology",  # Mock industry
+                    "company_name": ticker,
+                    "sector": "Technology",  # Mock sector
+                    "short_interest": round(short_interest, 2),
+                    "short_ratio": round(short_ratio, 2),
+                    "days_to_cover": round(days_to_cover, 2),
+                    "squeeze_score": squeeze_score,
+                    "reddit_mentions": random.randint(5, 50)  # Mock mention count
+                })
+                
+            except Exception as e:
+                print(f"Error processing ticker {ticker}: {e}")
+                continue
+        
+        # Sort by squeeze score (highest first)
+        shorts_squeeze_data.sort(key=lambda x: x["squeeze_score"], reverse=True)
+        
+        return shorts_squeeze_data
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

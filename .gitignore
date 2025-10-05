@@ -11,3 +11,11 @@ __pycache__/
 *.pdb
 *.pyc
 .envfile
+
+# Cache directories
+cache/
+*.cache
+
+# IDE directories
+.vscode/
+data/
