@@ -3,16 +3,22 @@
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from utils.polygon_client import get_price_history
+from utils.polygon_client import get_price_history, get_market_snapshot
 import pandas as pd
 import json
 import os
+import random
+import logging
 
 # Import ticker universe service
 from services.ticker_universe_service import ticker_universe
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 # Cache configuration
-CACHE_DURATION_HOURS = 1  # Cache for 1 hour
+CACHE_DURATION_HOURS = 8  # Cache for 8 hours
 CACHE_FILE = "cache/stock_screener_cache.json"
 
 def load_cache() -> Dict:
@@ -237,6 +243,11 @@ def get_stock_performance_data(ticker: str, days_back: int = 180) -> Optional[Di
 
 def screen_stocks(filters: Dict) -> List[Dict]:
     """Main screening function"""
+    start_time = time.time()
+    logger.info("=" * 80)
+    logger.info("🚀 STOCK SCREENER STARTED")
+    logger.info("=" * 80)
+    
     sector = filters.get("sector", "tech")
     min_1m = filters.get("min_1m_performance", 10.0)
     min_3m = filters.get("min_3m_performance", 20.0)
@@ -248,15 +259,38 @@ def screen_stocks(filters: Dict) -> List[Dict]:
     rsi_signal = filters.get("rsi_signal", "all")
     limit = filters.get("limit", 50)
     
+    logger.info(f"📊 Filters: sector={sector}, 1M>={min_1m}%, 3M>={min_3m}%, 6M>={min_6m}%")
+    logger.info(f"💰 Price: ${min_price}-${max_price}, RSI: {min_rsi}-{max_rsi}, Signal: {rsi_signal}")
+    logger.info(f"🎯 Limit: {limit} results")
+    
     # Get tickers from universe or fallback to predefined sectors
     try:
         if sector == "all" or sector not in SECTOR_TICKERS:
             # Try to get all tickers from universe
             all_tickers = ticker_universe.get_ticker_symbols()
             if all_tickers:
-                # Use more stocks from universe for better screening
-                tickers = all_tickers[:2000]  # Increased from 500 to 2000 for better coverage
-                print(f"📊 Screening {len(tickers)} stocks from universe (using first 2000 for performance)...")
+                # With unlimited API calls, we can use the full universe!
+                # But start with a reasonable subset for performance
+                total = len(all_tickers)
+                
+                # Option 1: Use all tickers (set use_full_universe=True in filters)
+                # Option 2: Use configurable sample size (default 3000)
+                use_full_universe = filters.get("use_full_universe", False)
+                sample_size = filters.get("sample_size", 3000)
+                
+                if use_full_universe:
+                    tickers = all_tickers
+                    logger.info(f"📊 FULL SCAN MODE: Screening all {len(tickers)} stocks from universe")
+                    logger.info(f"⏱️  Estimated time: 30-60 minutes (first run), instant (cached)")
+                else:
+                    # Use stratified sampling for faster results
+                    sample_size = min(sample_size, total)
+                    step = max(1, total // sample_size)
+                    tickers = [all_tickers[i] for i in range(0, total, step)][:sample_size]
+                    random.shuffle(tickers)
+                    logger.info(f"📊 SAMPLE SCAN MODE: Screening {len(tickers)} stocks (stratified from {total} total)")
+                    logger.info(f"🌍 Coverage: Full A-Z alphabet distribution")
+                    logger.info(f"💡 Tip: Add use_full_universe=true to scan all {total} stocks")
             else:
                 # Fallback to predefined sectors
                 tickers = []
@@ -281,27 +315,49 @@ def screen_stocks(filters: Dict) -> List[Dict]:
         print(f"Using fallback: {len(tickers)} stocks...")
     
     # Try to load from cache first
+    logger.info("=" * 80)
+    logger.info("💾 LOADING CACHE")
     cached_data = load_cache()
+    logger.info(f"✅ Loaded {len(cached_data)} stocks from cache")
+    
+    logger.info("=" * 80)
+    logger.info("🔍 SCREENING STOCKS")
+    logger.info(f"📊 Total tickers to process: {len(tickers)}")
+    
     screened_stocks = []
     new_data = {}
+    cached_count = 0
+    fetched_count = 0
+    failed_count = 0
     
     for i, ticker in enumerate(tickers):
         try:
+            # Progress indicator every 10 stocks
+            if i % 10 == 0 and i > 0:
+                elapsed = time.time() - start_time
+                rate = i / elapsed
+                eta = (len(tickers) - i) / rate if rate > 0 else 0
+                logger.info(f"⚡ Progress: {i}/{len(tickers)} ({i/len(tickers)*100:.1f}%) | "
+                          f"Cached: {cached_count} | Fetched: {fetched_count} | Failed: {failed_count} | "
+                          f"ETA: {eta/60:.1f}min")
+            
             # Check cache first
             if ticker in cached_data:
                 stock_data = cached_data[ticker]
-                print(f"📦 Using cached data for {ticker}")
+                cached_count += 1
             else:
-                # Rate limiting - pause every 10 requests
-                if i % 10 == 0 and i > 0:
-                    time.sleep(0.5)
+                # Light rate limiting to avoid overwhelming the API
+                # With unlimited calls, we can be more aggressive
+                if i % 50 == 0 and i > 0:
+                    time.sleep(0.1)  # Small pause every 50 requests
                 
                 stock_data = get_stock_performance_data(ticker)
                 if stock_data:
                     new_data[ticker] = stock_data
-                    print(f"🔄 Fetched fresh data for {ticker}")
+                    fetched_count += 1
             
             if not stock_data:
+                failed_count += 1
                 continue
             
             # Apply filters
@@ -324,23 +380,178 @@ def screen_stocks(filters: Dict) -> List[Dict]:
                 rsi_signal_match):
                 
                 screened_stocks.append(stock_data)
-                print(f"✅ {ticker}: {stock_data['performance_1m']}% 1M, {stock_data['performance_3m']}% 3M, {stock_data['performance_6m']}% 6M, RSI: {rsi:.1f} ({rsi_signal_value}), Signal: {stock_data['overall_signal']}")
+                logger.info(f"✅ MATCH: {ticker} - {stock_data['performance_1m']}% 1M, "
+                          f"{stock_data['performance_3m']}% 3M, {stock_data['performance_6m']}% 6M, "
+                          f"RSI: {rsi:.1f} ({rsi_signal_value}), Signal: {stock_data['overall_signal']}")
             
         except Exception as e:
-            print(f"Error processing {ticker}: {e}")
+            logger.error(f"❌ Error processing {ticker}: {e}")
+            failed_count += 1
             continue
+    
+    # Final statistics
+    logger.info("=" * 80)
+    logger.info("📊 SCREENING COMPLETE")
+    logger.info(f"✅ Total processed: {len(tickers)}")
+    logger.info(f"📦 From cache: {cached_count}")
+    logger.info(f"🔄 Newly fetched: {fetched_count}")
+    logger.info(f"❌ Failed: {failed_count}")
+    logger.info(f"🎯 Matches found: {len(screened_stocks)}")
     
     # Save new data to cache
     if new_data:
+        logger.info("💾 SAVING TO CACHE")
         # Merge new data with existing cache
         updated_cache = {**cached_data, **new_data}
         save_cache(updated_cache)
+        logger.info(f"✅ Cached {len(updated_cache)} total stocks")
     
     # Sort by ADR% (highest first)
     screened_stocks.sort(key=lambda x: x["adr_percentage"], reverse=True)
     
     # Limit results
+    total_time = time.time() - start_time
+    logger.info(f"⏱️  Total execution time: {total_time:.2f}s ({total_time/60:.2f}min)")
+    logger.info(f"📤 Returning top {min(limit, len(screened_stocks))} results")
+    logger.info("=" * 80)
+    
     return screened_stocks[:limit]
+
+def get_market_snapshot_data(tickers: Optional[List[str]] = None, include_otc: bool = False) -> Dict:
+    """
+    Get a comprehensive market snapshot for the entire U.S. stock market
+    
+    Args:
+        tickers: Optional list of specific tickers to get snapshots for.
+                 If None or empty, returns all tickers (10,000+).
+        include_otc: Whether to include OTC securities. Default is False.
+    
+    Returns:
+        Dictionary containing formatted snapshot data with market-wide statistics
+    """
+    try:
+        logger.info("=" * 80)
+        logger.info("📊 FETCHING MARKET SNAPSHOT")
+        
+        if tickers:
+            logger.info(f"📌 Requested tickers: {len(tickers)}")
+        else:
+            logger.info("🌐 Fetching complete market snapshot (10,000+ tickers)")
+        
+        if include_otc:
+            logger.info("📈 Including OTC securities")
+        
+        # Call the Polygon API
+        snapshot_data = get_market_snapshot(tickers=tickers, include_otc=include_otc)
+        
+        # Extract tickers from response
+        tickers_data = snapshot_data.get("tickers", [])
+        
+        logger.info(f"✅ Received {len(tickers_data)} tickers")
+        
+        # Format the data for easier consumption
+        formatted_tickers = []
+        for ticker_data in tickers_data:
+            day_data = ticker_data.get("day", {})
+            prev_day_data = ticker_data.get("prevDay", {})
+            last_trade = ticker_data.get("lastTrade", {})
+            
+            formatted_ticker = {
+                "ticker": ticker_data.get("ticker"),
+                "current_price": day_data.get("c", 0),
+                "open": day_data.get("o", 0),
+                "high": day_data.get("h", 0),
+                "low": day_data.get("l", 0),
+                "close": day_data.get("c", 0),
+                "volume": day_data.get("v", 0),
+                "vwap": day_data.get("vw", 0),  # Volume-weighted average price
+                "todays_change": ticker_data.get("todaysChange", 0),
+                "todays_change_perc": ticker_data.get("todaysChangePerc", 0),
+                "prev_day": {
+                    "close": prev_day_data.get("c", 0),
+                    "high": prev_day_data.get("h", 0),
+                    "low": prev_day_data.get("l", 0),
+                    "open": prev_day_data.get("o", 0),
+                    "volume": prev_day_data.get("v", 0)
+                },
+                "last_trade": {
+                    "price": last_trade.get("p", 0),
+                    "size": last_trade.get("s", 0),
+                    "timestamp": last_trade.get("t", 0)
+                },
+                "updated": ticker_data.get("updated", 0)
+            }
+            
+            formatted_tickers.append(formatted_ticker)
+        
+        # Calculate market-wide statistics
+        if formatted_tickers:
+            total_volume = sum(t["volume"] for t in formatted_tickers)
+            gainers = sum(1 for t in formatted_tickers if t["todays_change_perc"] > 0)
+            losers = sum(1 for t in formatted_tickers if t["todays_change_perc"] < 0)
+            unchanged = len(formatted_tickers) - gainers - losers
+            
+            # Find top movers
+            sorted_by_change = sorted(formatted_tickers, 
+                                    key=lambda x: x["todays_change_perc"], 
+                                    reverse=True)
+            
+            market_stats = {
+                "total_tickers": len(formatted_tickers),
+                "total_volume": total_volume,
+                "gainers": gainers,
+                "losers": losers,
+                "unchanged": unchanged,
+                "top_gainers": [
+                    {
+                        "ticker": t["ticker"],
+                        "change_perc": round(t["todays_change_perc"], 2),
+                        "price": t["current_price"],
+                        "volume": t["volume"]
+                    }
+                    for t in sorted_by_change[:10]
+                ],
+                "top_losers": [
+                    {
+                        "ticker": t["ticker"],
+                        "change_perc": round(t["todays_change_perc"], 2),
+                        "price": t["current_price"],
+                        "volume": t["volume"]
+                    }
+                    for t in sorted_by_change[-10:][::-1]
+                ]
+            }
+        else:
+            market_stats = {
+                "total_tickers": 0,
+                "total_volume": 0,
+                "gainers": 0,
+                "losers": 0,
+                "unchanged": 0,
+                "top_gainers": [],
+                "top_losers": []
+            }
+        
+        logger.info(f"📈 Gainers: {market_stats['gainers']}, Losers: {market_stats['losers']}, Unchanged: {market_stats['unchanged']}")
+        logger.info(f"📊 Total Volume: {market_stats['total_volume']:,}")
+        logger.info("=" * 80)
+        
+        return {
+            "status": snapshot_data.get("status", "OK"),
+            "count": len(formatted_tickers),
+            "market_statistics": market_stats,
+            "tickers": formatted_tickers
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error fetching market snapshot: {e}")
+        return {
+            "status": "ERROR",
+            "error": str(e),
+            "count": 0,
+            "market_statistics": {},
+            "tickers": []
+        }
 
 def get_available_sectors() -> Dict:
     """Get list of available sectors and their ticker counts"""

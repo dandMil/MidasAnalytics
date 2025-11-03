@@ -308,7 +308,9 @@ def get_stock_screener(
     min_rsi: float = 0.0,
     max_rsi: float = 100.0,
     rsi_signal: str = "all",  # "all", "oversold", "overbought", "neutral"
-    limit: int = 50
+    limit: int = 50,
+    use_full_universe: bool = False,  # Set to true to scan ALL 11,802 stocks (slower but complete)
+    sample_size: int = 3000  # Number of stocks to sample if not using full universe
 ):
     try:
         from services.stock_screener_service import screen_stocks
@@ -323,7 +325,9 @@ def get_stock_screener(
             "min_rsi": min_rsi,
             "max_rsi": max_rsi,
             "rsi_signal": rsi_signal,
-            "limit": limit
+            "limit": limit,
+            "use_full_universe": use_full_universe,
+            "sample_size": sample_size
         }
         
         results = screen_stocks(filters)

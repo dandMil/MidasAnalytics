@@ -4,6 +4,19 @@ A comprehensive financial analytics platform with AI-powered trading insights, R
 
 ## 🚀 Quick Setup
 
+### 🎯 Easiest Way - Using Start Scripts
+
+```bash
+# Start the backend (foreground - see logs)
+./start_backend.sh
+
+# OR start in background (detached)
+./start_backend_daemon.sh
+
+# Stop the backend
+./stop_backend.sh
+```
+
 ### Option 1: Using Pipenv (Recommended)
 ```bash
 # Run the setup script

@@ -1,6 +1,7 @@
 import os
 import requests
 from datetime import datetime, timedelta
+from typing import Optional, List
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
@@ -64,3 +65,39 @@ def get_top_movers(direction: str = "gainers") -> list[dict]:
         }
         for t in tickers
     ]
+
+
+def get_market_snapshot(tickers: Optional[List[str]] = None, include_otc: bool = False) -> dict:
+    """
+    Get a comprehensive snapshot of the entire U.S. stock market
+    
+    Args:
+        tickers: Optional list of specific tickers to get snapshots for. 
+                 If None or empty, returns all tickers.
+        include_otc: Whether to include OTC securities. Default is False.
+    
+    Returns:
+        Dictionary containing the snapshot response
+    """
+    POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+    
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+    
+    params = {
+        "apiKey": POLYGON_API_KEY
+    }
+    
+    # Add tickers parameter if provided
+    if tickers and len(tickers) > 0:
+        params["tickers"] = ",".join(tickers)
+    
+    # Add include_otc parameter
+    if include_otc:
+        params["include_otc"] = "true"
+    
+    response = requests.get(url, params=params)
+    
+    if response.status_code != 200:
+        raise Exception(f"[Polygon] Failed to fetch market snapshot: {response.text}")
+    
+    return response.json()
