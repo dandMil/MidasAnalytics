@@ -18,8 +18,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Cache configuration
-CACHE_DURATION_HOURS = 8  # Cache for 8 hours
+CACHE_DURATION_HOURS = 48  # Temporarily increased to 48 hours  
 CACHE_FILE = "cache/stock_screener_cache.json"
+CHECKPOINT_FILE = "cache/screener_checkpoint.json"
+CHECKPOINT_INTERVAL = 50  # Save checkpoint every N tickers
 
 def load_cache() -> Dict:
     """Load cached stock data"""
@@ -57,6 +59,67 @@ def save_cache(stock_data: Dict):
         print(f"💾 Cached {len(stock_data)} stocks for {CACHE_DURATION_HOURS} hours")
     except Exception as e:
         print(f"⚠️ Error saving cache: {e}")
+
+
+def load_checkpoint() -> Optional[Dict]:
+    """Load checkpoint data for batch mode resume"""
+    try:
+        if os.path.exists(CHECKPOINT_FILE):
+            with open(CHECKPOINT_FILE, 'r') as f:
+                checkpoint_data = json.load(f)
+            
+            # Check if checkpoint is still valid (not older than cache duration)
+            checkpoint_time = datetime.fromisoformat(checkpoint_data.get('timestamp', '1970-01-01'))
+            if datetime.now() - checkpoint_time < timedelta(hours=CACHE_DURATION_HOURS):
+                logger.info(f"📋 Found valid checkpoint from {checkpoint_time}")
+                return checkpoint_data
+            else:
+                logger.info(f"⏰ Checkpoint expired (age: {datetime.now() - checkpoint_time})")
+                return None
+    except Exception as e:
+        logger.warning(f"⚠️ Error loading checkpoint: {e}")
+    return None
+
+
+def save_checkpoint(processed_tickers: List[str], filters_hash: str, batch_id: str, stats: Dict):
+    """Save checkpoint data for batch mode resume"""
+    try:
+        os.makedirs(os.path.dirname(CHECKPOINT_FILE), exist_ok=True)
+        
+        checkpoint_data = {
+            'timestamp': datetime.now().isoformat(),
+            'batch_id': batch_id,
+            'filters_hash': filters_hash,
+            'processed_tickers': processed_tickers,
+            'stats': stats
+        }
+        
+        with open(CHECKPOINT_FILE, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        
+        logger.debug(f"💾 Checkpoint saved: {len(processed_tickers)} tickers processed")
+    except Exception as e:
+        logger.error(f"⚠️ Error saving checkpoint: {e}")
+
+
+def clear_checkpoint():
+    """Clear checkpoint file"""
+    try:
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+            logger.info("🗑️  Checkpoint cleared")
+    except Exception as e:
+        logger.error(f"⚠️ Error clearing checkpoint: {e}")
+
+
+def get_filters_hash(filters: Dict) -> str:
+    """Generate a hash of filters to match checkpoints"""
+    import hashlib
+    # Create a stable representation of filters (excluding batch_id and resume flag)
+    filter_copy = {k: v for k, v in filters.items() 
+                   if k not in ['batch_id']}  # batch_id excluded as it's auto-generated
+    filter_str = json.dumps(filter_copy, sort_keys=True)
+    return hashlib.md5(filter_str.encode()).hexdigest()[:8]
 
 # Define sector tickers (fallback for when universe is not available)
 SECTOR_TICKERS = {
@@ -252,16 +315,25 @@ def screen_stocks(filters: Dict) -> List[Dict]:
     min_1m = filters.get("min_1m_performance", 10.0)
     min_3m = filters.get("min_3m_performance", 20.0)
     min_6m = filters.get("min_6m_performance", 30.0)
+    # Handle None values for optional max filters
+    max_1m = filters.get("max_1m_performance") if filters.get("max_1m_performance") is not None else 999999.0
+    max_3m = filters.get("max_3m_performance") if filters.get("max_3m_performance") is not None else 999999.0
+    max_6m = filters.get("max_6m_performance") if filters.get("max_6m_performance") is not None else 999999.0
     min_price = filters.get("min_price", 1.0)
     max_price = filters.get("max_price", 50.0)
     min_rsi = filters.get("min_rsi", 0.0)
     max_rsi = filters.get("max_rsi", 100.0)
+    # Handle None values for optional ADR filters
+    min_adr = filters.get("min_adr") if filters.get("min_adr") is not None else 0.0
+    max_adr = filters.get("max_adr") if filters.get("max_adr") is not None else 999999.0
     rsi_signal = filters.get("rsi_signal", "all")
+    sort_by = filters.get("sort_by", "adr")  # Default: sort by ADR
+    sort_order = filters.get("sort_order", "desc")  # Default: descending
     limit = filters.get("limit", 50)
     
-    logger.info(f"📊 Filters: sector={sector}, 1M>={min_1m}%, 3M>={min_3m}%, 6M>={min_6m}%")
-    logger.info(f"💰 Price: ${min_price}-${max_price}, RSI: {min_rsi}-{max_rsi}, Signal: {rsi_signal}")
-    logger.info(f"🎯 Limit: {limit} results")
+    logger.info(f"📊 Filters: sector={sector}, 1M: {min_1m}%-{max_1m}%, 3M: {min_3m}%-{max_3m}%, 6M: {min_6m}%-{max_6m}%")
+    logger.info(f"💰 Price: ${min_price}-${max_price}, RSI: {min_rsi}-{max_rsi}, ADR: {min_adr}-{max_adr}%")
+    logger.info(f"🔍 Signal: {rsi_signal}, Sort: {sort_by} ({sort_order}), Limit: {limit}")
     
     # Get tickers from universe or fallback to predefined sectors
     try:
@@ -273,24 +345,25 @@ def screen_stocks(filters: Dict) -> List[Dict]:
                 # But start with a reasonable subset for performance
                 total = len(all_tickers)
                 
-                # Option 1: Use all tickers (set use_full_universe=True in filters)
-                # Option 2: Use configurable sample size (default 3000)
-                use_full_universe = filters.get("use_full_universe", False)
+                # Default: Process ALL tickers to get true top performers by ADR
+                # Only sample if explicitly requested (for faster testing/development)
+                use_sample = filters.get("use_sample", False)
                 sample_size = filters.get("sample_size", 3000)
                 
-                if use_full_universe:
-                    tickers = all_tickers
-                    logger.info(f"📊 FULL SCAN MODE: Screening all {len(tickers)} stocks from universe")
-                    logger.info(f"⏱️  Estimated time: 30-60 minutes (first run), instant (cached)")
-                else:
-                    # Use stratified sampling for faster results
+                if use_sample:
+                    # Use stratified sampling for faster results (testing/development only)
                     sample_size = min(sample_size, total)
                     step = max(1, total // sample_size)
                     tickers = [all_tickers[i] for i in range(0, total, step)][:sample_size]
                     random.shuffle(tickers)
-                    logger.info(f"📊 SAMPLE SCAN MODE: Screening {len(tickers)} stocks (stratified from {total} total)")
-                    logger.info(f"🌍 Coverage: Full A-Z alphabet distribution")
-                    logger.info(f"💡 Tip: Add use_full_universe=true to scan all {total} stocks")
+                    logger.info(f"📊 SAMPLE MODE: Screening {len(tickers)} stocks (stratified from {total} total)")
+                    logger.info(f"⚠️  Note: Sampling may miss top performers. Use default (no sampling) for accurate rankings.")
+                else:
+                    # Process all tickers to ensure accurate top X rankings
+                    tickers = all_tickers
+                    logger.info(f"📊 FULL SCAN MODE: Processing all {len(tickers)} stocks for accurate ranking")
+                    logger.info(f"⏱️  Estimated time: ~60 minutes (first run with API calls), instant (if cached)")
+                    logger.info(f"💡 Cache duration: {CACHE_DURATION_HOURS} hours - subsequent runs will be fast!")
             else:
                 # Fallback to predefined sectors
                 tickers = []
@@ -314,21 +387,65 @@ def screen_stocks(filters: Dict) -> List[Dict]:
             tickers = SECTOR_TICKERS.get(sector, SECTOR_TICKERS["tech"])
         print(f"Using fallback: {len(tickers)} stocks...")
     
+    # Store original ticker list for completion tracking
+    original_ticker_list = tickers.copy()
+    original_ticker_count = len(original_ticker_list)
+    filters_hash = get_filters_hash(filters)
+    batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     # Try to load from cache first
     logger.info("=" * 80)
     logger.info("💾 LOADING CACHE")
     cached_data = load_cache()
     logger.info(f"✅ Loaded {len(cached_data)} stocks from cache")
     
+    # Automatically check for existing checkpoint and resume if valid
+    logger.info("=" * 80)
+    logger.info("🔍 CHECKING FOR EXISTING PROGRESS")
+    processed_tickers = set()
+    checkpoint_stats = {"cached_count": 0, "fetched_count": 0, "failed_count": 0}
+    
+    checkpoint = load_checkpoint()
+    if checkpoint:
+        # Verify checkpoint matches current filters
+        if checkpoint.get('filters_hash') == filters_hash:
+            checkpoint_processed = set(checkpoint.get('processed_tickers', []))
+            # Only count tickers that are in the current original list (avoid double counting from different runs)
+            processed_tickers = set([t for t in checkpoint_processed if t in original_ticker_list])
+            checkpoint_stats = checkpoint.get('stats', checkpoint_stats)
+            batch_id = checkpoint.get('batch_id', batch_id)  # Use existing batch_id
+            logger.info(f"📋 RESUMING: Found checkpoint with {len(checkpoint_processed)} tickers ({(len(processed_tickers))} in current universe)")
+            logger.info(f"📊 Previous stats: Cached={checkpoint_stats['cached_count']}, "
+                      f"Fetched={checkpoint_stats['fetched_count']}, Failed={checkpoint_stats['failed_count']}")
+            
+            # Filter out already processed tickers (only those in current universe)
+            if processed_tickers:
+                remaining_tickers = [t for t in tickers if t not in processed_tickers]
+                logger.info(f"⏭️  Skipping {len(processed_tickers)} already processed tickers")
+                logger.info(f"📊 Remaining to process: {len(remaining_tickers)} / {original_ticker_count}")
+                tickers = remaining_tickers
+        else:
+            logger.info(f"⚠️  Checkpoint exists but filters don't match. Starting fresh.")
+            logger.info(f"   (Old filters hash: {checkpoint.get('filters_hash')[:8]}, New: {filters_hash[:8]})")
+            clear_checkpoint()
+            processed_tickers = set()
+    else:
+        logger.info("🆕 No existing checkpoint - starting fresh")
+    
     logger.info("=" * 80)
     logger.info("🔍 SCREENING STOCKS")
     logger.info(f"📊 Total tickers to process: {len(tickers)}")
+    if processed_tickers:
+        logger.info(f"🔧 Batch ID: {batch_id} | Resuming from checkpoint")
+    
+    # Track how many were processed at the start (from checkpoint, only in current universe)
+    processed_at_start = len([t for t in processed_tickers if t in original_ticker_list])
     
     screened_stocks = []
     new_data = {}
-    cached_count = 0
-    fetched_count = 0
-    failed_count = 0
+    cached_count = checkpoint_stats.get("cached_count", 0)
+    fetched_count = checkpoint_stats.get("fetched_count", 0)
+    failed_count = checkpoint_stats.get("failed_count", 0)
     
     for i, ticker in enumerate(tickers):
         try:
@@ -337,7 +454,11 @@ def screen_stocks(filters: Dict) -> List[Dict]:
                 elapsed = time.time() - start_time
                 rate = i / elapsed
                 eta = (len(tickers) - i) / rate if rate > 0 else 0
+                # Use processed_at_start (calculated once at start) + current progress (i)
+                # This avoids double-counting since processed_tickers grows during the loop
+                total_processed = processed_at_start + i
                 logger.info(f"⚡ Progress: {i}/{len(tickers)} ({i/len(tickers)*100:.1f}%) | "
+                          f"Total: {total_processed}/{original_ticker_count} | "
                           f"Cached: {cached_count} | Fetched: {fetched_count} | Failed: {failed_count} | "
                           f"ETA: {eta/60:.1f}min")
             
@@ -358,7 +479,30 @@ def screen_stocks(filters: Dict) -> List[Dict]:
             
             if not stock_data:
                 failed_count += 1
+                # Mark as processed (even if failed) so we don't retry on resume
+                processed_tickers.add(ticker)
                 continue
+            
+            # Mark ticker as processed (always track for resume capability)
+            processed_tickers.add(ticker)
+            
+            # Incremental cache save and checkpoint (automatic checkpointing)
+            if (i + 1) % CHECKPOINT_INTERVAL == 0:
+                # Merge new data into cache
+                updated_cache = {**cached_data, **new_data}
+                save_cache(updated_cache)
+                cached_data = updated_cache  # Update local cache reference
+                
+                # Save checkpoint
+                checkpoint_stats = {
+                    "cached_count": cached_count,
+                    "fetched_count": fetched_count,
+                    "failed_count": failed_count
+                }
+                save_checkpoint(list(processed_tickers), filters_hash, batch_id, checkpoint_stats)
+                logger.info(f"💾 Checkpoint saved: {len(processed_tickers)}/{original_ticker_count} tickers processed, "
+                          f"{len(new_data)} new items cached")
+                new_data = {}  # Clear new_data since it's now in cache
             
             # Apply filters
             rsi = stock_data.get("rsi", 50)
@@ -370,13 +514,21 @@ def screen_stocks(filters: Dict) -> List[Dict]:
                               (rsi_signal == "overbought" and rsi_signal_value == "OVERBOUGHT") or
                               (rsi_signal == "neutral" and rsi_signal_value == "NEUTRAL"))
             
+            adr = stock_data.get("adr_percentage", 0)
+            
+            # Apply all filters
             if (stock_data["current_price"] >= min_price and 
                 stock_data["current_price"] <= max_price and
                 stock_data["performance_1m"] >= min_1m and
+                stock_data["performance_1m"] <= max_1m and
                 stock_data["performance_3m"] >= min_3m and
+                stock_data["performance_3m"] <= max_3m and
                 stock_data["performance_6m"] >= min_6m and
+                stock_data["performance_6m"] <= max_6m and
                 rsi >= min_rsi and
                 rsi <= max_rsi and
+                adr >= min_adr and
+                adr <= max_adr and
                 rsi_signal_match):
                 
                 screened_stocks.append(stock_data)
@@ -390,29 +542,68 @@ def screen_stocks(filters: Dict) -> List[Dict]:
             continue
     
     # Final statistics
+    # Count only tickers that are in the original list (to avoid double counting)
+    total_processed = len([t for t in processed_tickers if t in original_ticker_list])
+    processed_this_run = total_processed - processed_at_start
     logger.info("=" * 80)
     logger.info("📊 SCREENING COMPLETE")
-    logger.info(f"✅ Total processed: {len(tickers)}")
+    # Calculate how many were processed in THIS run
+    processed_this_run = total_processed - processed_at_start
+    logger.info(f"✅ Total processed in this run: {processed_this_run}")
+    logger.info(f"📋 Total processed overall: {total_processed}/{original_ticker_count}")
     logger.info(f"📦 From cache: {cached_count}")
     logger.info(f"🔄 Newly fetched: {fetched_count}")
     logger.info(f"❌ Failed: {failed_count}")
     logger.info(f"🎯 Matches found: {len(screened_stocks)}")
     
-    # Save new data to cache
+    # Save final cache and checkpoint
     if new_data:
-        logger.info("💾 SAVING TO CACHE")
+        logger.info("💾 SAVING FINAL CACHE")
         # Merge new data with existing cache
         updated_cache = {**cached_data, **new_data}
         save_cache(updated_cache)
         logger.info(f"✅ Cached {len(updated_cache)} total stocks")
     
-    # Sort by ADR% (highest first)
-    screened_stocks.sort(key=lambda x: x["adr_percentage"], reverse=True)
+    # Save final checkpoint (always enabled)
+    checkpoint_stats = {
+        "cached_count": cached_count,
+        "fetched_count": fetched_count,
+        "failed_count": failed_count
+    }
+    save_checkpoint(list(processed_tickers), filters_hash, batch_id, checkpoint_stats)
+    logger.info(f"💾 Final checkpoint saved: {total_processed}/{original_ticker_count} tickers processed")
     
-    # Limit results
+    # Check if complete (all tickers processed)
+    is_complete = len(processed_tickers) >= original_ticker_count
+    if is_complete:
+        logger.info("✅ COMPLETE - All tickers processed!")
+        clear_checkpoint()
+        logger.info("🗑️  Checkpoint cleared (processing complete)")
+    else:
+        logger.info(f"⏸️  IN PROGRESS - {original_ticker_count - total_processed} tickers remaining")
+        logger.info(f"💡 Call again to resume from checkpoint")
+    
+    # Sort ALL filtered stocks by specified field and order
+    # This ensures accurate rankings - we process all tickers, filter them all, 
+    # sort them all, then return the top X (not just top X from a sample)
+    sort_key_map = {
+        "adr": "adr_percentage",
+        "rsi": "rsi",
+        "performance_1m": "performance_1m",
+        "performance_3m": "performance_3m",
+        "performance_6m": "performance_6m"
+    }
+    
+    sort_key = sort_key_map.get(sort_by, "adr_percentage")
+    reverse_order = (sort_order.lower() == "desc")
+    
+    # Ensure sort key exists in data, default to 0 if missing
+    screened_stocks.sort(key=lambda x: x.get(sort_key, 0), reverse=reverse_order)
+    
+    # Return top X results from the complete sorted list
     total_time = time.time() - start_time
     logger.info(f"⏱️  Total execution time: {total_time:.2f}s ({total_time/60:.2f}min)")
-    logger.info(f"📤 Returning top {min(limit, len(screened_stocks))} results")
+    logger.info(f"📊 Filtered matches: {len(screened_stocks)} | Returning top {min(limit, len(screened_stocks))} by ADR%")
     logger.info("=" * 80)
     
     return screened_stocks[:limit]

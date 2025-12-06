@@ -11,7 +11,11 @@ from routes.daily_summary_routes import router as daily_summary_router
 from services.reddit import reddit_scraper as scrapper
 from services.top_mover_service import fetch_top_movers
 from services.technical_indicator_service import calculate_technical_indicators
-from services.portfolio_service import purchase_asset, fetch_portfolio
+from services.portfolio_service import purchase_asset, fetch_portfolio, do_transaction
+from services.paper_trading_service import (
+    do_paper_transaction, get_paper_account, get_paper_portfolio, 
+    get_paper_transactions, reset_paper_account, update_paper_account
+)
 from services.trade_recommendation_service import (
     calculate_trade_recommendations,
     fetch_trade_recommendation
@@ -92,9 +96,16 @@ def fetch_shorts_data(lookback: int = Query(7, description="Number of days to lo
 # ------------------------------
 
 @app.get("/midas/asset/top_movers")
-def get_top_movers(mover: str = "gainers"):
+def get_top_movers(mover: str = "gainers", include_indicators: bool = False):
+    """
+    Get top movers (gainers or losers) with optional technical indicators.
+    
+    Args:
+        mover: "gainers" or "losers"
+        include_indicators: If True, include technical indicators (RSI, MACD, ADR, signals, etc.)
+    """
     try:
-        result = fetch_top_movers(mover)
+        result = fetch_top_movers(mover, include_indicators=include_indicators)
         # Ensure the result is wrapped in a data object as expected by frontend
         if isinstance(result, list):
             return {"data": result}
@@ -297,21 +308,174 @@ async def sell_asset_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/midas/do_transaction")
+async def do_transaction_endpoint(request: Request):
+    """
+    Execute a transaction (buy or sell) with stop loss and take profit.
+    
+    Request body:
+    {
+        "ticker": "AAPL",
+        "shares": 10,  # Positive for buy, negative for sell
+        "current_price": 150.00,
+        "stop_loss": 145.00,
+        "take_profit": 160.00
+    }
+    """
+    try:
+        data = await request.json()
+        ticker = data.get("ticker")
+        shares = data.get("shares")
+        current_price = data.get("current_price")
+        stop_loss = data.get("stop_loss")
+        take_profit = data.get("take_profit")
+        
+        # Validate required fields
+        if not ticker:
+            raise HTTPException(status_code=400, detail="ticker is required")
+        if shares is None:
+            raise HTTPException(status_code=400, detail="shares is required")
+        if current_price is None:
+            raise HTTPException(status_code=400, detail="current_price is required")
+        
+        # Execute transaction
+        result = do_transaction(
+            ticker=ticker,
+            shares=int(shares),
+            current_price=float(current_price),
+            stop_loss=float(stop_loss) if stop_loss is not None else None,
+            take_profit=float(take_profit) if take_profit is not None else None
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transaction failed: {str(e)}")
+
+
+# ------------------------------
+# Paper Trading Endpoints
+# ------------------------------
+
+@app.post("/midas/paper_trade/do_transaction")
+async def do_paper_transaction_endpoint(request: Request):
+    """
+    Execute a paper trading transaction (buy or sell) with cash balance tracking.
+    
+    Request body:
+    {
+        "ticker": "AAPL",
+        "shares": 10,  # Positive for buy, negative for sell
+        "current_price": 150.00,
+        "stop_loss": 145.00,
+        "take_profit": 160.00
+    }
+    """
+    try:
+        data = await request.json()
+        ticker = data.get("ticker")
+        shares = data.get("shares")
+        current_price = data.get("current_price")
+        stop_loss = data.get("stop_loss")
+        take_profit = data.get("take_profit")
+        
+        # Validate required fields
+        if not ticker:
+            raise HTTPException(status_code=400, detail="ticker is required")
+        if shares is None:
+            raise HTTPException(status_code=400, detail="shares is required")
+        if current_price is None:
+            raise HTTPException(status_code=400, detail="current_price is required")
+        
+        # Execute paper transaction
+        result = do_paper_transaction(
+            ticker=ticker,
+            shares=int(shares),
+            current_price=float(current_price),
+            stop_loss=float(stop_loss) if stop_loss is not None else None,
+            take_profit=float(take_profit) if take_profit is not None else None
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Paper transaction failed: {str(e)}")
+
+
+@app.get("/midas/paper_trade/account")
+def get_paper_account_endpoint():
+    """Get paper trading account status (cash balance, P&L, portfolio value)"""
+    try:
+        account = update_paper_account()  # Update balances first
+        return account
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get account: {str(e)}")
+
+
+@app.get("/midas/paper_trade/portfolio")
+def get_paper_portfolio_endpoint():
+    """Get paper trading portfolio positions with current values and P&L"""
+    try:
+        portfolio = get_paper_portfolio()
+        return portfolio
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get portfolio: {str(e)}")
+
+
+@app.get("/midas/paper_trade/transactions")
+def get_paper_transactions_endpoint(limit: int = 50):
+    """Get paper trading transaction history"""
+    try:
+        transactions = get_paper_transactions(limit=limit)
+        return transactions
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get transactions: {str(e)}")
+
+
+@app.post("/midas/paper_trade/reset")
+async def reset_paper_account_endpoint(request: Request):
+    """Reset paper trading account (clear all positions and reset to starting capital)"""
+    try:
+        data = await request.json() if request.body else {}
+        starting_capital = data.get("starting_capital", 100000.0)
+        
+        result = reset_paper_account(starting_capital=float(starting_capital))
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reset account: {str(e)}")
+
+
 @app.get("/midas/asset/stock_screener")
 def get_stock_screener(
     sector: str = "all",  # "tech", "bio", "finance", "energy", "all"
     min_1m_performance: float = 10.0,
     min_3m_performance: float = 20.0,
     min_6m_performance: float = 30.0,
+    max_1m_performance: float = None,  # Optional max performance filters
+    max_3m_performance: float = None,
+    max_6m_performance: float = None,
     min_price: float = 1.0,
     max_price: float = 50.0,
     min_rsi: float = 0.0,
     max_rsi: float = 100.0,
+    min_adr: float = None,  # Optional ADR filters
+    max_adr: float = None,
     rsi_signal: str = "all",  # "all", "oversold", "overbought", "neutral"
+    sort_by: str = "adr",  # "adr", "rsi", "performance_1m", "performance_3m", "performance_6m"
+    sort_order: str = "desc",  # "asc" or "desc"
     limit: int = 50,
-    use_full_universe: bool = False,  # Set to true to scan ALL 11,802 stocks (slower but complete)
-    sample_size: int = 3000  # Number of stocks to sample if not using full universe
+    use_sample: bool = False,  # Set to true to sample (faster but less accurate). Default processes ALL tickers for true rankings.
+    sample_size: int = 3000  # Number of stocks to sample if use_sample=true
 ):
+    """
+    Stock screener with automatic checkpoint/resume capability.
+    Automatically checks for existing progress and resumes if available.
+    Uses cache when available, only fetches new data when needed.
+    """
     try:
         from services.stock_screener_service import screen_stocks
         
@@ -320,13 +484,20 @@ def get_stock_screener(
             "min_1m_performance": min_1m_performance,
             "min_3m_performance": min_3m_performance,
             "min_6m_performance": min_6m_performance,
+            "max_1m_performance": max_1m_performance,
+            "max_3m_performance": max_3m_performance,
+            "max_6m_performance": max_6m_performance,
             "min_price": min_price,
             "max_price": max_price,
             "min_rsi": min_rsi,
             "max_rsi": max_rsi,
+            "min_adr": min_adr,
+            "max_adr": max_adr,
             "rsi_signal": rsi_signal,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
             "limit": limit,
-            "use_full_universe": use_full_universe,
+            "use_sample": use_sample,
             "sample_size": sample_size
         }
         

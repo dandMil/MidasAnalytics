@@ -12,14 +12,24 @@ POLYGON_TOP_MOVERS_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/s
 
 DB_FILE = "watchlist.db"  # Simple SQLite file for now
 
+# Import for technical indicators
+from services.stock_screener_service import get_stock_performance_data
+
 
 # -------------------------
 # Fetch Real-Time Top Movers
 # -------------------------
 
-def fetch_top_movers(mover_type: str):
+def fetch_top_movers(mover_type: str, include_indicators: bool = False):
     """
     Fetch top gainers or losers from Polygon and format for frontend.
+    
+    Args:
+        mover_type: "gainers" or "losers"
+        include_indicators: If True, fetch technical indicators for each ticker
+    
+    Returns:
+        List of mover dictionaries with optional technical indicators
     """
     if mover_type == "losers":
         url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/losers"
@@ -37,8 +47,10 @@ def fetch_top_movers(mover_type: str):
 
     for ticker_info in data.get('tickers', []):
         day = ticker_info.get('day', {})
-        movers.append({
-            "ticker": ticker_info.get('ticker'),
+        ticker = ticker_info.get('ticker')
+        
+        mover_data = {
+            "ticker": ticker,
             "todaysChangePerc": ticker_info.get('todaysChangePercent', 0.0),
             "todaysChange": ticker_info.get('todaysChange', 0.0),
             "updated": ticker_info.get('updated', 0),
@@ -50,7 +62,32 @@ def fetch_top_movers(mover_type: str):
                 "v": day.get('v', 0),
                 "vw": day.get('vw', 0.0)
             }
-        })
+        }
+        
+        # Add technical indicators if requested
+        if include_indicators:
+            try:
+                stock_data = get_stock_performance_data(ticker, days_back=60)
+                if stock_data:
+                    mover_data.update({
+                        "rsi": stock_data.get("rsi", 50),
+                        "rsi_signal": stock_data.get("rsi_signal", "NEUTRAL"),
+                        "macd": stock_data.get("macd", 0),
+                        "macd_signal": stock_data.get("macd_signal", 0),
+                        "stochastic_oscillator": stock_data.get("stochastic_oscillator", 50),
+                        "adr_percentage": stock_data.get("adr_percentage", 0),
+                        "atr": stock_data.get("atr", 0),
+                        "overall_signal": stock_data.get("overall_signal", "NEUTRAL"),
+                        "overall_score": stock_data.get("overall_score", 0),
+                        "performance_1m": stock_data.get("performance_1m", 0),
+                        "performance_3m": stock_data.get("performance_3m", 0),
+                        "performance_6m": stock_data.get("performance_6m", 0)
+                    })
+            except Exception as e:
+                # If indicators fail, continue without them
+                print(f"Warning: Failed to fetch indicators for {ticker}: {e}")
+        
+        movers.append(mover_data)
 
     return movers
 

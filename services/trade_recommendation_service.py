@@ -31,12 +31,30 @@ def select_strategy(atr, so, rsi, macd, roc):
 
 def calculate_trade_recommendations(ticker: str, entry_price: float) -> dict:
     indicators = calculate_technical_indicators(ticker, "stock")
+    
+    # Check if indicators returned an error
+    if "error" in indicators:
+        # Return default recommendations if indicators failed
+        take_profit = entry_price * (1 + PROFIT_TARGET_PERCENTAGE / 100)
+        stop_loss = entry_price * (1 - STOP_LOSS_PERCENTAGE / 100)
+        return {
+            "ticker": ticker,
+            "strategy": PERCENTAGE_BASED,
+            "price_entry": round_sig(entry_price),
+            "take_profit": round_sig(take_profit),
+            "stop_loss": round_sig(stop_loss),
+            "expected_profit": round_sig(take_profit - entry_price),
+            "expected_loss": round_sig(entry_price - stop_loss),
+            "recommendation_date": datetime.now().isoformat(),
+            "error": indicators["error"]
+        }
 
-    atr = indicators["atr"]
-    so = indicators["stochastic_oscillator"]
-    rsi = indicators["relative_strength_index"]
-    macd = indicators["macd"]
-    roc = indicators["price_rate_of_change"]
+    # Use "rsi" key (not "relative_strength_index") - matches what calculate_technical_indicators returns
+    atr = indicators.get("atr", 0)
+    so = indicators.get("stochastic_oscillator", 50)
+    rsi = indicators.get("rsi", 50)  # Fixed: use "rsi" not "relative_strength_index"
+    macd = indicators.get("macd", 0)
+    roc = indicators.get("price_rate_of_change", 0)
 
     strategy = select_strategy(atr, so, rsi, macd, roc)
 
