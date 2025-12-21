@@ -101,3 +101,69 @@ def get_market_snapshot(tickers: Optional[List[str]] = None, include_otc: bool =
         raise Exception(f"[Polygon] Failed to fetch market snapshot: {response.text}")
     
     return response.json()
+
+
+def get_price_history_at_date(ticker: str, end_date: str, days_back: int = 180) -> list[dict]:
+    """
+    Get historical price data up to a specific end date.
+    This allows us to see the data as it existed at that point in time.
+    
+    Args:
+        ticker: Stock ticker symbol
+        end_date: End date in YYYY-MM-DD format (data will be fetched up to this date)
+        days_back: Number of days back from end_date to fetch
+    
+    Returns:
+        List of price bars (OHLCV data) up to end_date
+    """
+    POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+    
+    # Calculate start date
+    end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
+    start_date_obj = end_date_obj - timedelta(days=days_back)
+    start_date = start_date_obj.strftime("%Y-%m-%d")
+    
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
+    params = {
+        "adjusted": "true",
+        "sort": "asc",
+        "apiKey": POLYGON_API_KEY
+    }
+    
+    response = requests.get(url, params=params)
+    if response.status_code != 200:
+        raise Exception(f"[Polygon] Failed to fetch historical price data: {response.text}")
+    
+    return response.json().get("results", [])
+
+
+def get_forward_price_history(ticker: str, start_date: str, end_date: Optional[str] = None) -> list[dict]:
+    """
+    Get price data from a start date forward.
+    Used to track performance after entry.
+    
+    Args:
+        ticker: Stock ticker symbol
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format (defaults to today if None)
+    
+    Returns:
+        List of price bars (OHLCV data) from start_date to end_date
+    """
+    POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+    
+    if end_date is None:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+    
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
+    params = {
+        "adjusted": "true",
+        "sort": "asc",
+        "apiKey": POLYGON_API_KEY
+    }
+    
+    response = requests.get(url, params=params)
+    if response.status_code != 200:
+        raise Exception(f"[Polygon] Failed to fetch forward price data: {response.text}")
+    
+    return response.json().get("results", [])

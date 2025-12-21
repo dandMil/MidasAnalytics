@@ -5,6 +5,8 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
+import logging
+from datetime import datetime
 from fastapi import APIRouter, Query
 from services.reddit.reddit_scraper import RedditScraper
 from routes.daily_summary_routes import router as daily_summary_router
@@ -21,10 +23,21 @@ from services.trade_recommendation_service import (
     fetch_trade_recommendation
 )
 from services.daily_summary.daily_summary_service import generate_daily_summary
+from services.historical_screener_service import get_historical_rankings
+from services.backtest_trade_simulator import simulate_trade
+from services.backtest_session_cache import (
+    create_session, get_session, find_session_by_date,
+    update_session, add_trade_to_session,
+    list_sessions, delete_session, clear_expired_sessions
+)
 
 # Load environment variables
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # FastAPI app setup
 app = FastAPI()
@@ -667,3 +680,341 @@ def get_shorts_squeeze():
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------------------
+# Backtesting Endpoints
+# ------------------------------
+
+@app.get("/midas/backtest/historical_rankings")
+def get_historical_rankings_endpoint(
+    reference_date: str = Query(..., description="Reference date in YYYY-MM-DD format"),
+    top_n: int = Query(50, description="Number of top stocks to return"),
+    sector: str = Query(None, description="Optional sector filter (tech, finance, energy, bio)"),
+    min_price: float = Query(None, description="Optional minimum price filter"),
+    max_price: float = Query(None, description="Optional maximum price filter"),
+    min_adr: float = Query(None, description="Optional minimum ADR filter"),
+    max_adr: float = Query(None, description="Optional maximum ADR filter"),
+    # Performance filters (matching regular scanner)
+    min_1m_performance: float = Query(None, description="Optional minimum 1-month performance filter (%)"),
+    max_1m_performance: float = Query(None, description="Optional maximum 1-month performance filter (%)"),
+    min_3m_performance: float = Query(None, description="Optional minimum 3-month performance filter (%)"),
+    max_3m_performance: float = Query(None, description="Optional maximum 3-month performance filter (%)"),
+    min_6m_performance: float = Query(None, description="Optional minimum 6-month performance filter (%)"),
+    max_6m_performance: float = Query(None, description="Optional maximum 6-month performance filter (%)"),
+    sort_by: str = Query("adr", description="Field to sort by (adr, rsi, performance_1m, etc.)"),
+    sort_order: str = Query("desc", description="Sort order (asc or desc)"),
+    # Optimization parameters
+    use_sample: bool = Query(False, description="Use sampling for faster results (trades accuracy for speed)"),
+    sample_size: int = Query(1000, description="Number of stocks to sample if use_sample=True"),
+    max_universe_size: int = Query(None, description="Maximum number of stocks to process"),
+    enable_rate_limiting: bool = Query(True, description="Enable rate limiting between API calls"),
+    # Parallel processing parameters (for Pro tier)
+    max_workers: int = Query(5, description="Number of concurrent worker threads (default: 5, recommended: 5-10 for Pro tier)"),
+    rate_limit_per_minute: int = Query(200, description="API rate limit per minute (default: 200 for Pro tier, use 5 for free tier)")
+):
+    """
+    Get historical stock rankings as they would have appeared at the reference_date.
+    All calculations use only data available up to that date (no look-ahead bias).
+    """
+    try:
+        logger.info(f"📥 Received request for historical rankings: reference_date={reference_date}, top_n={top_n}, sector={sector}")
+        
+        # Validate reference_date format
+        try:
+            ref_date_obj = datetime.strptime(reference_date, "%Y-%m-%d")
+        except ValueError:
+            logger.error(f"❌ Invalid date format: {reference_date}")
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        
+        # Validate that reference_date is not in the future
+        now = datetime.now()
+        if ref_date_obj > now:
+            logger.error(f"❌ Reference date is in the future: {reference_date} (today is {now.strftime('%Y-%m-%d')})")
+            raise HTTPException(status_code=400, detail=f"Reference date cannot be in the future. Today is {now.strftime('%Y-%m-%d')}")
+        
+        logger.info(f"✅ Date validation passed: {reference_date}")
+        
+        filters = {}
+        if min_price is not None:
+            filters['min_price'] = min_price
+        if max_price is not None:
+            filters['max_price'] = max_price
+        if min_adr is not None:
+            filters['min_adr'] = min_adr
+        if max_adr is not None:
+            filters['max_adr'] = max_adr
+        # Performance filters (matching regular scanner)
+        if min_1m_performance is not None:
+            filters['min_1m_performance'] = min_1m_performance
+        if max_1m_performance is not None:
+            filters['max_1m_performance'] = max_1m_performance
+        if min_3m_performance is not None:
+            filters['min_3m_performance'] = min_3m_performance
+        if max_3m_performance is not None:
+            filters['max_3m_performance'] = max_3m_performance
+        if min_6m_performance is not None:
+            filters['min_6m_performance'] = min_6m_performance
+        if max_6m_performance is not None:
+            filters['max_6m_performance'] = max_6m_performance
+        
+        # Optimization parameters
+        opt_params = {}
+        if use_sample is not None:
+            opt_params['use_sample'] = use_sample
+        if sample_size is not None:
+            opt_params['sample_size'] = sample_size
+        if max_universe_size is not None:
+            opt_params['max_universe_size'] = max_universe_size
+        if enable_rate_limiting is not None:
+            opt_params['enable_rate_limiting'] = enable_rate_limiting
+        
+        # Parallel processing parameters (for Pro tier)
+        opt_params['max_workers'] = max_workers
+        opt_params['rate_limit_per_minute'] = rate_limit_per_minute
+        
+        # Check if session already exists
+        filters_dict = {**filters}
+        if sector:
+            filters_dict['sector'] = sector
+        if sort_by:
+            filters_dict['sort_by'] = sort_by
+        if sort_order:
+            filters_dict['sort_order'] = sort_order
+        
+        existing_session = find_session_by_date(reference_date, filters_dict if filters_dict else None)
+        
+        if existing_session and existing_session.get('historical_rankings'):
+            logger.info(f"📂 Found existing session for {reference_date}, returning cached rankings")
+            return {
+                "rankings": existing_session['historical_rankings'],
+                "session_id": existing_session['session_id'],
+                "from_cache": True
+            }
+        
+        # Generate new rankings (this creates session early and updates it when complete)
+        result = get_historical_rankings(
+            reference_date=reference_date,
+            top_n=top_n,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            sector=sector,
+            min_price=filters.get('min_price'),
+            max_price=filters.get('max_price'),
+            min_adr=filters.get('min_adr'),
+            max_adr=filters.get('max_adr'),
+            min_1m_performance=filters.get('min_1m_performance'),
+            max_1m_performance=filters.get('max_1m_performance'),
+            min_3m_performance=filters.get('min_3m_performance'),
+            max_3m_performance=filters.get('max_3m_performance'),
+            min_6m_performance=filters.get('min_6m_performance'),
+            max_6m_performance=filters.get('max_6m_performance'),
+            **opt_params
+        )
+        
+        # Handle both old format (list) and new format (dict with rankings and session_id)
+        if isinstance(result, dict) and 'rankings' in result:
+            return {
+                "rankings": result['rankings'],
+                "session_id": result.get('session_id'),
+                "from_cache": False
+            }
+        else:
+            # Fallback for old format (shouldn't happen, but handle gracefully)
+            new_session = find_session_by_date(reference_date, filters_dict if filters_dict else None)
+            session_id = new_session.get('session_id') if new_session else None
+            return {
+                "rankings": result,
+                "session_id": session_id,
+                "from_cache": False
+            }
+        
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # ValueErrors are user-facing issues (like missing universe file)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"❌ Error in historical rankings endpoint: {e}")
+        logger.error(f"Traceback: {error_trace}")
+        raise HTTPException(status_code=500, detail=f"Failed to get historical rankings: {str(e)}")
+
+
+@app.post("/midas/backtest/simulate_trade")
+async def simulate_trade_endpoint(request: Request):
+    """
+    Simulate a trade forward from entry date and track performance.
+    """
+    try:
+        data = await request.json()
+        
+        # Validate required fields
+        required_fields = ['ticker', 'entry_date', 'entry_price', 'quantity']
+        for field in required_fields:
+            if field not in data:
+                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        
+        # Validate entry_date format
+        try:
+            datetime.strptime(data['entry_date'], "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid entry_date format. Use YYYY-MM-DD")
+        
+        # Validate exit_date format if provided
+        if 'exit_date' in data and data['exit_date']:
+            try:
+                datetime.strptime(data['exit_date'], "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid exit_date format. Use YYYY-MM-DD")
+        
+        result = simulate_trade(
+            ticker=data['ticker'],
+            entry_date=data['entry_date'],
+            entry_price=float(data['entry_price']),
+            quantity=int(data['quantity']),
+            stop_loss=float(data.get('stop_loss')) if data.get('stop_loss') else None,
+            take_profit=float(data.get('take_profit')) if data.get('take_profit') else None,
+            exit_date=data.get('exit_date'),
+            max_hold_days=int(data.get('max_hold_days')) if data.get('max_hold_days') else None
+        )
+        
+        # Save trade to session cache if session_id is provided
+        if 'session_id' in data:
+            try:
+                trade_config = {
+                    'entry_date': data['entry_date'],
+                    'entry_price': float(data['entry_price']),
+                    'quantity': int(data['quantity']),
+                    'stop_loss': float(data.get('stop_loss')) if data.get('stop_loss') else None,
+                    'take_profit': float(data.get('take_profit')) if data.get('take_profit') else None,
+                    'exit_date': data.get('exit_date'),
+                    'max_hold_days': int(data.get('max_hold_days')) if data.get('max_hold_days') else None
+                }
+                add_trade_to_session(data['session_id'], data['ticker'], trade_config, result)
+                result['session_id'] = data['session_id']  # Include in response
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to save trade to session: {e}")
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Trade simulation failed: {str(e)}")
+
+
+@app.post("/midas/backtest/run_strategy")
+async def run_strategy_backtest_endpoint(request: Request):
+    """
+    Run a complete strategy backtest (for future use - full implementation later).
+    """
+    try:
+        data = await request.json()
+        return {
+            "message": "Strategy backtesting not yet implemented",
+            "received_params": data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Strategy backtest failed: {str(e)}")
+
+
+# ------------------------------
+# Backtesting Session Management Endpoints
+# ------------------------------
+
+@app.get("/midas/backtest/sessions")
+def list_backtest_sessions():
+    """
+    List all available backtesting sessions.
+    """
+    try:
+        # Clean up expired sessions first
+        clear_expired_sessions()
+        
+        sessions = list_sessions()
+        return {
+            "sessions": sessions,
+            "count": len(sessions)
+        }
+    except Exception as e:
+        logger.error(f"❌ Error listing sessions: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list sessions: {str(e)}")
+
+
+@app.get("/midas/backtest/sessions/{session_id}")
+def get_backtest_session(session_id: str):
+    """
+    Get a specific backtesting session by ID.
+    """
+    try:
+        session = get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found or expired")
+        return session
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error getting session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get session: {str(e)}")
+
+
+@app.get("/midas/backtest/sessions/by_date/{reference_date}")
+def find_backtest_session_by_date(
+    reference_date: str,
+    sector: str = Query(None),
+    sort_by: str = Query(None)
+):
+    """
+    Find a backtesting session by reference date and filters.
+    """
+    try:
+        filters = {}
+        if sector:
+            filters['sector'] = sector
+        if sort_by:
+            filters['sort_by'] = sort_by
+        
+        session = find_session_by_date(reference_date, filters if filters else None)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"No session found for {reference_date}")
+        return session
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error finding session for {reference_date}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to find session: {str(e)}")
+
+
+@app.delete("/midas/backtest/sessions/{session_id}")
+def delete_backtest_session(session_id: str):
+    """
+    Delete a backtesting session.
+    """
+    try:
+        success = delete_session(session_id)
+        if not success:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        return {"message": f"Session {session_id} deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error deleting session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete session: {str(e)}")
+
+
+@app.post("/midas/backtest/sessions/clear_expired")
+def clear_expired_backtest_sessions():
+    """
+    Manually trigger cleanup of expired sessions.
+    """
+    try:
+        deleted_count = clear_expired_sessions()
+        return {
+            "message": f"Cleaned up {deleted_count} expired sessions",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        logger.error(f"❌ Error clearing expired sessions: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear expired sessions: {str(e)}")
