@@ -24,7 +24,10 @@ from services.stock_screener_service import (
     calculate_macd,
     calculate_stochastic_oscillator,
     calculate_atr,
-    SECTOR_TICKERS
+    SECTOR_TICKERS,
+    SIC_SECTOR_MAPPING,
+    PREDEFINED_TO_SIC_MAPPING,
+    load_tickers_from_sic_csv
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -275,13 +278,50 @@ def get_historical_rankings(
         raise ValueError(f"Failed to load ticker universe: {str(e)}")
     
     # OPTIMIZATION 1: Filter by sector if provided
-    if sector and sector.lower() != "all" and sector.lower() in SECTOR_TICKERS:
-        ticker_list = SECTOR_TICKERS[sector.lower()]
-        logger.info(f"📊 Sector filter applied: {sector} ({len(ticker_list)} stocks)")
-    elif sector and sector.lower() != "all":
-        logger.warning(f"⚠️  Unknown sector '{sector}', using full universe")
+    # Support for: universe, all, predefined sectors (tech, energy, bio, finance), SIC sectors (tech_sic, energy_sic, healthcare_sic)
+    if not sector or sector.lower() == "all":
         ticker_list = all_tickers
+        logger.info(f"📊 Using full universe: {len(ticker_list)} stocks")
+    elif sector.lower() == "universe":
+        ticker_list = all_tickers
+        logger.info(f"📊 Using full universe: {len(ticker_list)} stocks")
+    elif sector.lower() in PREDEFINED_TO_SIC_MAPPING:
+        # Predefined sector (tech, energy, bio) -> use SIC-based sector
+        sic_sector_key = PREDEFINED_TO_SIC_MAPPING[sector.lower()]
+        sic_config = SIC_SECTOR_MAPPING[sic_sector_key]
+        logger.info(f"📊 Sector '{sector}' mapped to SIC-based sector: {sic_config['display_name']}")
+        
+        # Try to load from SIC CSV file
+        ticker_list = load_tickers_from_sic_csv(sic_config['csv_file'])
+        
+        # Fallback to predefined sector if SIC CSV is empty or not found
+        if not ticker_list:
+            logger.warning(f"⚠️  SIC CSV not available, falling back to predefined {sector} sector")
+            ticker_list = SECTOR_TICKERS.get(sector.lower(), all_tickers)
+            logger.info(f"📊 Using {len(ticker_list)} tickers from predefined {sector} sector")
+        else:
+            logger.info(f"✅ Loaded {len(ticker_list)} tickers from SIC-based {sic_config['display_name']} sector (mapped from '{sector}')")
+    elif sector.lower() in SIC_SECTOR_MAPPING:
+        # Direct SIC sector (tech_sic, energy_sic, healthcare_sic)
+        sic_config = SIC_SECTOR_MAPPING[sector.lower()]
+        logger.info(f"📊 Using SIC-based sector: {sic_config['display_name']}")
+        
+        # Try to load from SIC CSV file
+        ticker_list = load_tickers_from_sic_csv(sic_config['csv_file'])
+        
+        # Fallback to predefined sector if SIC CSV is empty or not found
+        if not ticker_list:
+            logger.warning(f"⚠️  SIC CSV not available, falling back to predefined {sic_config['fallback']} sector")
+            ticker_list = SECTOR_TICKERS.get(sic_config['fallback'], all_tickers)
+            logger.info(f"📊 Using {len(ticker_list)} tickers from predefined {sic_config['fallback']} sector")
+        else:
+            logger.info(f"✅ Loaded {len(ticker_list)} tickers from SIC-based {sic_config['display_name']} sector")
+    elif sector.lower() in SECTOR_TICKERS:
+        # Predefined sector (tech, finance, energy, bio) - use predefined list
+        ticker_list = SECTOR_TICKERS[sector.lower()]
+        logger.info(f"📊 Sector filter applied: {sector} ({len(ticker_list)} stocks from predefined list)")
     else:
+        logger.warning(f"⚠️  Unknown sector '{sector}', using full universe")
         ticker_list = all_tickers
     
     if not ticker_list or len(ticker_list) == 0:

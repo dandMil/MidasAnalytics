@@ -1,13 +1,16 @@
 # services/paper_trading_service.py
 
 import sqlite3
-from datetime import datetime, date
+import os
+import shutil
+from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional
 from services.trade_recommendation_service import calculate_trade_recommendations
 from utils.polygon_client import get_price_history
 
 DB_FILE = "portfolio.db"
 DEFAULT_STARTING_CAPITAL = 100000.0  # $100k default paper trading account
+BACKUP_DIR = "portfolio_backups"
 
 def initialize_paper_trading_db():
     """Initialize paper trading tables"""
@@ -24,9 +27,22 @@ def initialize_paper_trading_db():
             stop_loss REAL,
             take_profit REAL,
             type TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            date_purchased TEXT,
+            max_hold_days INTEGER
         )
     """)
+    
+    # Add new columns if they don't exist (migration for existing databases)
+    try:
+        cur.execute("ALTER TABLE paper_portfolio ADD COLUMN date_purchased TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
+    try:
+        cur.execute("ALTER TABLE paper_portfolio ADD COLUMN max_hold_days INTEGER")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     
     # Paper transactions table
     cur.execute("""
@@ -70,18 +86,57 @@ def initialize_paper_trading_db():
         """, (DEFAULT_STARTING_CAPITAL, DEFAULT_STARTING_CAPITAL, DEFAULT_STARTING_CAPITAL, 0.0, 0.0, 0.0, 
               datetime.now().isoformat(), date.today().isoformat()))
     
+    # Migrate existing records: set date_purchased to yesterday if NULL
+    try:
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        cur.execute("""
+            UPDATE paper_portfolio 
+            SET date_purchased = COALESCE(date_purchased, ?), 
+                max_hold_days = COALESCE(max_hold_days, 60)
+            WHERE date_purchased IS NULL OR max_hold_days IS NULL
+        """, (yesterday,))
+    except Exception as e:
+        # Migration failed, but continue (might be first run or column doesn't exist yet)
+        print(f"Migration note: {e}")
+    
     conn.commit()
     conn.close()
 
 
 def get_current_price(ticker: str) -> float:
-    """Get current price for a ticker"""
+    """Get current price for a ticker using Polygon API, with yfinance fallback"""
+    # Try Polygon API first (fetch 5 days to handle weekends/holidays)
     try:
-        bars = get_price_history(ticker, days=1)
+        bars = get_price_history(ticker, days=5)
         if bars and len(bars) > 0:
-            return bars[-1].get('c', 0)  # Close price
+            # Get the most recent bar (last trading day)
+            price = bars[-1].get('c', 0)  # Close price
+            if price > 0:
+                return price
+            else:
+                print(f"Warning: Polygon returned price=0 for {ticker}, trying yfinance fallback")
+        else:
+            print(f"Warning: Polygon returned empty data for {ticker}, trying yfinance fallback")
     except Exception as e:
-        print(f"Error fetching price for {ticker}: {e}")
+        print(f"Error fetching price from Polygon for {ticker}: {e}, trying yfinance fallback")
+    
+    # Fallback to yfinance if Polygon fails
+    try:
+        import yfinance as yf
+        df = yf.download(ticker, period="5d", interval="1d", progress=False)
+        if not df.empty and len(df) > 0:
+            price = float(df['Close'].iloc[-1])
+            if price > 0:
+                print(f"Successfully fetched price for {ticker} using yfinance: ${price:.2f}")
+                return price
+            else:
+                print(f"Warning: yfinance returned price=0 for {ticker}")
+        else:
+            print(f"Warning: yfinance returned empty data for {ticker}")
+    except Exception as e:
+        print(f"Error fetching price from yfinance for {ticker}: {e}")
+    
+    print(f"ERROR: Failed to fetch price for {ticker} from both Polygon and yfinance, returning 0.0")
     return 0.0
 
 
@@ -242,6 +297,7 @@ def do_paper_transaction(ticker: str, shares: int, current_price: float, stop_lo
         
         if row:
             # Existing position - dollar cost average
+            # Keep the original date_purchased (don't update it when adding to position)
             old_shares, old_price = row
             new_entry_price = calculate_dollar_cost_average(old_price, current_price, old_shares, abs_shares)
             new_shares = old_shares + abs_shares
@@ -252,11 +308,13 @@ def do_paper_transaction(ticker: str, shares: int, current_price: float, stop_lo
                 WHERE ticker = ?
             """, (new_shares, new_entry_price, stop_loss, take_profit, datetime.now().isoformat(), ticker))
         else:
-            # New position
+            # New position - set date_purchased to today
+            today_str = date.today().isoformat()
+            default_max_hold_days = 60  # Default 60 days like backtester
             cur.execute("""
-                INSERT INTO paper_portfolio (ticker, shares, entry_price, stop_loss, take_profit, type, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (ticker, abs_shares, current_price, stop_loss, take_profit, "stock", datetime.now().isoformat()))
+                INSERT INTO paper_portfolio (ticker, shares, entry_price, stop_loss, take_profit, type, updated_at, date_purchased, max_hold_days)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (ticker, abs_shares, current_price, stop_loss, take_profit, "stock", datetime.now().isoformat(), today_str, default_max_hold_days))
         
         # Deduct cash
         new_cash_balance = cash_balance - cost
@@ -376,17 +434,40 @@ def get_paper_portfolio() -> List[Dict]:
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     
-    cur.execute("SELECT ticker, shares, entry_price, stop_loss, take_profit, updated_at FROM paper_portfolio")
+    cur.execute("SELECT ticker, shares, entry_price, stop_loss, take_profit, updated_at, date_purchased, max_hold_days FROM paper_portfolio")
     positions = cur.fetchall()
     conn.close()
     
     portfolio = []
-    for ticker, shares, entry_price, stop_loss, take_profit, updated_at in positions:
+    today = date.today()
+    
+    for ticker, shares, entry_price, stop_loss, take_profit, updated_at, date_purchased, max_hold_days in positions:
         current_price = get_current_price(ticker)
         position_value = shares * current_price
         cost_basis = shares * entry_price
         unrealized_pnl = position_value - cost_basis
         unrealized_pnl_percent = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+        
+        # Calculate days held and days to close window
+        days_held = 0
+        days_to_close_window = None
+        
+        if date_purchased:
+            try:
+                purchase_date = datetime.strptime(date_purchased, "%Y-%m-%d").date()
+                days_held = (today - purchase_date).days
+                
+                # Calculate days to close window (days remaining until max_hold_days)
+                if max_hold_days:
+                    days_to_close_window = max_hold_days - days_held
+                    if days_to_close_window < 0:
+                        days_to_close_window = 0  # Already past max hold days
+            except (ValueError, TypeError):
+                pass  # Invalid date format, leave as default
+        
+        # Use default max_hold_days if None
+        if max_hold_days is None:
+            max_hold_days = 60
         
         portfolio.append({
             "ticker": ticker,
@@ -399,7 +480,9 @@ def get_paper_portfolio() -> List[Dict]:
             "unrealized_pnl_percent": round(unrealized_pnl_percent, 2),
             "stop_loss": stop_loss,
             "take_profit": take_profit,
-            "updated_at": updated_at
+            "updated_at": updated_at,
+            "date_purchased": date_purchased or (date.today() - timedelta(days=1)).isoformat(),
+            "days_to_close_window": days_to_close_window
         })
     
     return portfolio
@@ -435,17 +518,106 @@ def get_paper_transactions(limit: int = 50) -> List[Dict]:
     ]
 
 
-def reset_paper_account(starting_capital: float = DEFAULT_STARTING_CAPITAL) -> Dict:
-    """Reset paper trading account (clear positions and reset cash)"""
+def backup_portfolio_db() -> Optional[str]:
+    """Create a backup of the portfolio database before resetting
+    
+    Returns:
+        Path to the backup file if successful, None otherwise
+    """
+    if not os.path.exists(DB_FILE):
+        return None  # No database to backup
+    
+    # Create backup directory if it doesn't exist
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    
+    # Generate backup filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_filename = f"portfolio_backup_{timestamp}.db"
+    backup_path = os.path.join(BACKUP_DIR, backup_filename)
+    
+    try:
+        # Copy the database file
+        shutil.copy2(DB_FILE, backup_path)
+        return backup_path
+    except Exception as e:
+        print(f"Error creating backup: {e}")
+        return None
+
+def list_portfolio_backups() -> List[Dict]:
+    """List all portfolio database backups
+    
+    Returns:
+        List of backup information dictionaries
+    """
+    backups = []
+    
+    if not os.path.exists(BACKUP_DIR):
+        return backups
+    
+    try:
+        for filename in os.listdir(BACKUP_DIR):
+            if filename.startswith("portfolio_backup_") and filename.endswith(".db"):
+                backup_path = os.path.join(BACKUP_DIR, filename)
+                file_stat = os.stat(backup_path)
+                
+                # Extract timestamp from filename
+                timestamp_str = filename.replace("portfolio_backup_", "").replace(".db", "")
+                try:
+                    backup_time = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                except ValueError:
+                    backup_time = datetime.fromtimestamp(file_stat.st_mtime)
+                
+                backups.append({
+                    "filename": filename,
+                    "path": backup_path,
+                    "size_bytes": file_stat.st_size,
+                    "size_mb": round(file_stat.st_size / (1024 * 1024), 2),
+                    "created_at": backup_time.isoformat(),
+                    "created_at_readable": backup_time.strftime("%Y-%m-%d %H:%M:%S")
+                })
+        
+        # Sort by creation time (newest first)
+        backups.sort(key=lambda x: x["created_at"], reverse=True)
+        return backups
+    except Exception as e:
+        print(f"Error listing backups: {e}")
+        return []
+
+def reset_paper_account(starting_capital: float = DEFAULT_STARTING_CAPITAL, create_backup: bool = True) -> Dict:
+    """Reset paper trading account (clear positions and reset cash)
+    
+    Args:
+        starting_capital: Starting cash balance for the reset account
+        create_backup: If True, create a backup of the database before resetting
+    
+    Returns:
+        Dictionary with reset results and backup information
+    """
+    # Create backup before resetting
+    backup_path = None
+    if create_backup:
+        backup_path = backup_portfolio_db()
+    
     initialize_paper_trading_db()
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     
-    # Clear positions
+    # Clear paper trading positions
     cur.execute("DELETE FROM paper_portfolio")
     
-    # Clear transactions
+    # Clear paper trading transactions
     cur.execute("DELETE FROM paper_transactions")
+    
+    # Also clear regular portfolio tables if they exist
+    try:
+        cur.execute("DELETE FROM portfolio")
+    except sqlite3.OperationalError:
+        pass  # Table doesn't exist, that's fine
+    
+    try:
+        cur.execute("DELETE FROM transactions")
+    except sqlite3.OperationalError:
+        pass  # Table doesn't exist, that's fine
     
     # Reset account
     today = date.today().isoformat()
@@ -459,10 +631,19 @@ def reset_paper_account(starting_capital: float = DEFAULT_STARTING_CAPITAL) -> D
     conn.commit()
     conn.close()
     
-    return {
+    result = {
         "success": True,
         "message": f"Paper trading account reset with ${starting_capital:,.2f}",
         "starting_capital": starting_capital,
         "cash_balance": starting_capital
     }
+    
+    if backup_path:
+        result["backup_created"] = True
+        result["backup_path"] = backup_path
+        result["message"] += f" | Backup saved to: {backup_path}"
+    else:
+        result["backup_created"] = False
+    
+    return result
 

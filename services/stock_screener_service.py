@@ -1,6 +1,7 @@
 # services/stock_screener_service.py
 
 import time
+import csv
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from utils.polygon_client import get_price_history, get_market_snapshot
@@ -141,6 +142,71 @@ SECTOR_TICKERS = {
         "WMB", "OKE", "EPD", "ET", "ENB", "TRP", "PPL", "DUK", "SO", "NEE"
     ]
 }
+
+# SIC-based sector mapping (maps human-readable names to SIC CSV files)
+SIC_SECTOR_MAPPING = {
+    "tech_sic": {
+        "csv_file": "data/sic_tickers/tech_tickers_by_sic.csv",
+        "display_name": "Technology/AI",
+        "fallback": "tech"
+    },
+    "energy_sic": {
+        "csv_file": "data/sic_tickers/energy_tickers_by_sic.csv",
+        "display_name": "Energy",
+        "fallback": "energy"
+    },
+    "healthcare_sic": {
+        "csv_file": "data/sic_tickers/healthcare_tickers_by_sic.csv",
+        "display_name": "Healthcare/Biotech",
+        "fallback": "bio"
+    }
+}
+
+# Map predefined sector names to their SIC-based equivalents
+# When "tech", "energy", or "bio" is selected, use SIC-based sector instead
+PREDEFINED_TO_SIC_MAPPING = {
+    "tech": "tech_sic",
+    "energy": "energy_sic",
+    "bio": "healthcare_sic"
+}
+
+def load_tickers_from_sic_csv(csv_file_path: str) -> List[str]:
+    """
+    Load ticker symbols from a SIC-based CSV file.
+    
+    Args:
+        csv_file_path: Path to the SIC tickers CSV file (relative to project root)
+        
+    Returns:
+        List of ticker symbols
+    """
+    # Resolve path relative to project root
+    # Get the directory of this file (services/), go up one level to project root
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    absolute_path = os.path.join(project_root, csv_file_path)
+    
+    # Also try the path as-is (in case it's already absolute)
+    if not os.path.exists(absolute_path) and os.path.exists(csv_file_path):
+        absolute_path = csv_file_path
+    
+    if not os.path.exists(absolute_path):
+        logger.warning(f"⚠️  SIC CSV file not found: {absolute_path} (tried: {csv_file_path})")
+        return []
+    
+    try:
+        tickers = []
+        with open(absolute_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ticker = row.get('ticker', '').strip()
+                if ticker:
+                    tickers.append(ticker)
+        
+        logger.info(f"✅ Loaded {len(tickers)} tickers from {absolute_path}")
+        return tickers
+    except Exception as e:
+        logger.error(f"❌ Error loading SIC CSV {absolute_path}: {e}")
+        return []
 
 def calculate_performance_percentage(current_price: float, historical_price: float) -> float:
     """Calculate performance percentage"""
@@ -335,9 +401,69 @@ def screen_stocks(filters: Dict) -> List[Dict]:
     logger.info(f"💰 Price: ${min_price}-${max_price}, RSI: {min_rsi}-{max_rsi}, ADR: {min_adr}-{max_adr}%")
     logger.info(f"🔍 Signal: {rsi_signal}, Sort: {sort_by} ({sort_order}), Limit: {limit}")
     
-    # Get tickers from universe or fallback to predefined sectors
+    # Get tickers from universe, SIC CSV, or fallback to predefined sectors
     try:
-        if sector == "all" or sector not in SECTOR_TICKERS:
+        # Check if this is "universe" - use full ticker universe
+        if sector == "universe":
+            all_tickers = ticker_universe.get_ticker_symbols()
+            if all_tickers:
+                total = len(all_tickers)
+                
+                use_sample = filters.get("use_sample", False)
+                sample_size = filters.get("sample_size", 3000)
+                
+                if use_sample:
+                    sample_size = min(sample_size, total)
+                    step = max(1, total // sample_size)
+                    tickers = [all_tickers[i] for i in range(0, total, step)][:sample_size]
+                    random.shuffle(tickers)
+                    logger.info(f"📊 UNIVERSE MODE (SAMPLE): Screening {len(tickers)} stocks (stratified from {total} total)")
+                else:
+                    tickers = all_tickers
+                    logger.info(f"📊 UNIVERSE MODE: Processing all {len(tickers)} stocks from universe")
+                    logger.info(f"⏱️  Estimated time: ~60 minutes (first run), instant (if cached)")
+            else:
+                # Fallback to all predefined sectors
+                tickers = []
+                for sector_tickers in SECTOR_TICKERS.values():
+                    tickers.extend(sector_tickers)
+                tickers = list(dict.fromkeys(tickers))
+                logger.warning(f"⚠️ Universe not available, using predefined sectors: {len(tickers)} stocks")
+        
+        # Check if predefined sector should use SIC-based sector (e.g., "tech" -> "tech_sic")
+        elif sector in PREDEFINED_TO_SIC_MAPPING:
+            sic_sector_key = PREDEFINED_TO_SIC_MAPPING[sector]
+            sic_config = SIC_SECTOR_MAPPING[sic_sector_key]
+            logger.info(f"📊 Sector '{sector}' mapped to SIC-based sector: {sic_config['display_name']}")
+            
+            # Try to load from SIC CSV file
+            tickers = load_tickers_from_sic_csv(sic_config['csv_file'])
+            
+            # Fallback to predefined sector if SIC CSV is empty or not found
+            if not tickers:
+                logger.warning(f"⚠️  SIC CSV not available, falling back to predefined {sector} sector")
+                tickers = SECTOR_TICKERS.get(sector, SECTOR_TICKERS["tech"])
+                logger.info(f"📊 Using {len(tickers)} tickers from predefined {sector} sector")
+            else:
+                logger.info(f"✅ Loaded {len(tickers)} tickers from SIC-based {sic_config['display_name']} sector (mapped from '{sector}')")
+        
+        # Check if this is a SIC-based sector (e.g., "tech_sic")
+        elif sector in SIC_SECTOR_MAPPING:
+            sic_config = SIC_SECTOR_MAPPING[sector]
+            logger.info(f"📊 Using SIC-based sector: {sic_config['display_name']}")
+            
+            # Try to load from SIC CSV file
+            tickers = load_tickers_from_sic_csv(sic_config['csv_file'])
+            
+            # Fallback to predefined sector if SIC CSV is empty or not found
+            if not tickers:
+                logger.warning(f"⚠️  SIC CSV not available, falling back to predefined {sic_config['fallback']} sector")
+                tickers = SECTOR_TICKERS.get(sic_config['fallback'], SECTOR_TICKERS["tech"])
+                logger.info(f"📊 Using {len(tickers)} tickers from predefined {sic_config['fallback']} sector")
+            else:
+                logger.info(f"✅ Loaded {len(tickers)} tickers from SIC-based {sic_config['display_name']} sector")
+        
+        elif sector == "all" or sector not in SECTOR_TICKERS:
             # Try to get all tickers from universe
             all_tickers = ticker_universe.get_ticker_symbols()
             if all_tickers:
@@ -370,22 +496,41 @@ def screen_stocks(filters: Dict) -> List[Dict]:
                 for sector_tickers in SECTOR_TICKERS.values():
                     tickers.extend(sector_tickers)
                 tickers = list(dict.fromkeys(tickers))
-                print(f"⚠️ Screening {len(tickers)} stocks from predefined sectors (universe not available)...")
+                logger.warning(f"⚠️ Screening {len(tickers)} stocks from predefined sectors (universe not available)...")
         else:
             # Use predefined sector
             tickers = SECTOR_TICKERS.get(sector, SECTOR_TICKERS["tech"])
-            print(f"Screening {len(tickers)} {sector} stocks from predefined list...")
+            logger.info(f"📊 Screening {len(tickers)} {sector} stocks from predefined list...")
     except Exception as e:
-        print(f"⚠️ Error loading ticker universe: {e}")
+        logger.error(f"⚠️ Error loading ticker universe: {e}")
         # Fallback to predefined sectors
-        if sector == "all" or sector not in SECTOR_TICKERS:
+        if sector == "universe":
+            # Fallback to all predefined sectors if universe fails
+            tickers = []
+            for sector_tickers in SECTOR_TICKERS.values():
+                tickers.extend(sector_tickers)
+            tickers = list(dict.fromkeys(tickers))
+            logger.warning(f"Using fallback: {len(tickers)} stocks from predefined sectors...")
+        elif sector in PREDEFINED_TO_SIC_MAPPING:
+            # Try SIC-based sector first, then fallback to predefined
+            sic_sector_key = PREDEFINED_TO_SIC_MAPPING[sector]
+            sic_config = SIC_SECTOR_MAPPING[sic_sector_key]
+            tickers = load_tickers_from_sic_csv(sic_config['csv_file'])
+            if not tickers:
+                tickers = SECTOR_TICKERS.get(sector, SECTOR_TICKERS["tech"])
+            logger.warning(f"Using fallback: {len(tickers)} stocks from {sector} sector...")
+        elif sector in SIC_SECTOR_MAPPING:
+            sic_config = SIC_SECTOR_MAPPING[sector]
+            tickers = SECTOR_TICKERS.get(sic_config['fallback'], SECTOR_TICKERS["tech"])
+            logger.warning(f"Using fallback: {len(tickers)} stocks from {sic_config['fallback']} sector...")
+        elif sector == "all" or sector not in SECTOR_TICKERS:
             tickers = []
             for sector_tickers in SECTOR_TICKERS.values():
                 tickers.extend(sector_tickers)
             tickers = list(dict.fromkeys(tickers))
         else:
             tickers = SECTOR_TICKERS.get(sector, SECTOR_TICKERS["tech"])
-        print(f"Using fallback: {len(tickers)} stocks...")
+        logger.warning(f"Using fallback: {len(tickers)} stocks...")
     
     # Store original ticker list for completion tracking
     original_ticker_list = tickers.copy()
@@ -745,16 +890,54 @@ def get_market_snapshot_data(tickers: Optional[List[str]] = None, include_otc: b
         }
 
 def get_available_sectors() -> Dict:
-    """Get list of available sectors and their ticker counts"""
+    """
+    Get list of available sectors for frontend dropdown.
+    Returns only: Universe, All, and SIC-based sectors (Technology/AI, Energy, Healthcare/Biotech)
+    """
     sectors_info = {}
-    for sector, tickers in SECTOR_TICKERS.items():
-        sectors_info[sector] = {
-            "name": sector.title(),
-            "ticker_count": len(tickers),
-            "tickers": tickers[:10]  # Show first 10 tickers as examples
+    
+    # Add "universe" option (uses full ticker universe)
+    try:
+        all_universe_tickers = ticker_universe.get_ticker_symbols()
+        universe_count = len(all_universe_tickers) if all_universe_tickers else 0
+    except:
+        universe_count = 0
+    
+    sectors_info["universe"] = {
+        "name": "Universe",
+        "ticker_count": universe_count,
+        "tickers": all_universe_tickers[:20] if all_universe_tickers else [],
+        "type": "universe",
+        "value": "universe"  # Backend value to send
+    }
+    
+    # Add SIC-based sectors only (these are the ones we want in the dropdown)
+    for sector_key, sic_config in SIC_SECTOR_MAPPING.items():
+        # Try to load from CSV to get accurate count
+        tickers = load_tickers_from_sic_csv(sic_config['csv_file'])
+        
+        if not tickers:
+            # Fallback to predefined sector count
+            fallback_tickers = SECTOR_TICKERS.get(sic_config['fallback'], [])
+            ticker_count = len(fallback_tickers)
+            example_tickers = fallback_tickers[:10]
+            available = False
+        else:
+            ticker_count = len(tickers)
+            example_tickers = tickers[:10]
+            available = True
+        
+        sectors_info[sector_key] = {
+            "name": sic_config['display_name'],  # Human-readable name for frontend
+            "ticker_count": ticker_count,
+            "tickers": example_tickers,
+            "type": "sic_based",
+            "available": available,
+            "csv_file": sic_config['csv_file'],
+            "value": sector_key  # Backend value to send (e.g., "tech_sic")
         }
     
-    # Add "all" option
+    # Add "all" option (uses all predefined sectors combined)
     all_tickers = []
     for tickers in SECTOR_TICKERS.values():
         all_tickers.extend(tickers)
@@ -763,7 +946,9 @@ def get_available_sectors() -> Dict:
     sectors_info["all"] = {
         "name": "All Sectors",
         "ticker_count": len(all_tickers),
-        "tickers": all_tickers[:20]  # Show first 20 tickers as examples
+        "tickers": all_tickers[:20],  # Show first 20 tickers as examples
+        "type": "all",
+        "value": "all"  # Backend value to send
     }
     
     return sectors_info

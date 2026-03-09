@@ -17,9 +17,14 @@ def generate_daily_summary(top_n=5):
     top_gainers = get_top_movers("gainers")[:top_n]
     top_losers = get_top_movers("losers")[:top_n]
 
-    # Get Reddit mentions
-    reddit_scraper = RedditScraper(days_back=1)
-    reddit_tickers = reddit_scraper.scrape()[:top_n]
+    # Get Reddit mentions (optional - gracefully handle if Reddit API is unavailable)
+    reddit_tickers = []
+    try:
+        reddit_scraper = RedditScraper(days_back=1)
+        reddit_tickers = reddit_scraper.scrape()[:top_n]
+    except Exception as e:
+        print(f"[DailySummary] Reddit scraping failed (credentials may be missing): {e}")
+        # Continue without Reddit data - not critical for daily summary
 
     # Combine and deduplicate tickers
     tickers = list(set([t["ticker"] for t in top_gainers + top_losers] + reddit_tickers))

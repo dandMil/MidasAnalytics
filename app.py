@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Query
 from services.reddit.reddit_scraper import RedditScraper
 from routes.daily_summary_routes import router as daily_summary_router
@@ -240,27 +240,74 @@ def get_repeated_movers():
 
 
 @app.get("/midas/asset/volume")
-def get_asset_volume(ticker: str, range_period: str = "1M"):
+def get_asset_volume(ticker: str, range: str = "1M"):
+    """
+    Get volume data for a ticker over a specified time period.
+    
+    Supported ranges:
+    - 1D: Last day
+    - 7D: Last 7 days
+    - 1M: Last month (30 days)
+    - 3M: Last 3 months (90 days)
+    - 6M: Last 6 months (180 days)
+    - YTD: Year to date (from Jan 1 to today)
+    """
     try:
-        # For now, return mock volume data
-        import random
         from datetime import datetime, timedelta
+        from utils.polygon_client import get_price_history
         
-        # Generate mock volume data for the specified range
-        days = 30 if range_period == "1M" else 7 if range_period == "1W" else 1
+        # Calculate days based on range
+        today = datetime.now().date()
+        
+        if range == "1D":
+            days = 1
+            start_date = today - timedelta(days=1)
+        elif range == "7D":
+            days = 7
+            start_date = today - timedelta(days=7)
+        elif range == "1M":
+            days = 30
+            start_date = today - timedelta(days=30)
+        elif range == "3M":
+            days = 90
+            start_date = today - timedelta(days=90)
+        elif range == "6M":
+            days = 180
+            start_date = today - timedelta(days=180)
+        elif range == "YTD":
+            # Year to date: from January 1st of current year to today
+            start_date = datetime(today.year, 1, 1).date()
+            days = (today - start_date).days + 1
+        else:
+            # Default to 1M if invalid range
+            days = 30
+            start_date = today - timedelta(days=30)
+        
+        # Fetch price history from Polygon (includes volume)
+        bars = get_price_history(ticker, days=days)
+        
+        if not bars:
+            return []
+        
+        # Convert Polygon bars to volume data format
         volume_data = []
-        
-        base_date = datetime.now() - timedelta(days=days)
-        for i in range(days):
-            date = base_date + timedelta(days=i)
-            volume = random.randint(1000000, 10000000)  # Random volume between 1M and 10M
+        for bar in bars:
+            # Polygon returns timestamps in milliseconds
+            timestamp_ms = bar.get('t', 0)
+            date_obj = datetime.fromtimestamp(timestamp_ms / 1000).date()
+            volume = bar.get('v', 0)
+            
             volume_data.append({
-                "date": date.strftime("%Y-%m-%d"),
-                "volume": volume
+                "date": date_obj.strftime("%Y-%m-%d"),
+                "volume": int(volume)
             })
+        
+        # Sort by date ascending
+        volume_data.sort(key=lambda x: x['date'])
         
         return volume_data
     except Exception as e:
+        logger.error(f"Error fetching volume for {ticker}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -451,20 +498,46 @@ def get_paper_transactions_endpoint(limit: int = 50):
 
 @app.post("/midas/paper_trade/reset")
 async def reset_paper_account_endpoint(request: Request):
-    """Reset paper trading account (clear all positions and reset to starting capital)"""
+    """Reset paper trading account (clear all positions and reset to starting capital)
+    
+    Automatically creates a backup of the portfolio database before resetting.
+    Backup is saved to portfolio_backups/portfolio_backup_YYYYMMDD_HHMMSS.db
+    """
     try:
         data = await request.json() if request.body else {}
         starting_capital = data.get("starting_capital", 100000.0)
+        create_backup = data.get("create_backup", True)  # Default to True, can be disabled if needed
         
-        result = reset_paper_account(starting_capital=float(starting_capital))
+        result = reset_paper_account(
+            starting_capital=float(starting_capital),
+            create_backup=create_backup
+        )
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to reset account: {str(e)}")
 
 
+@app.get("/midas/paper_trade/backups")
+def list_portfolio_backups_endpoint():
+    """
+    List all portfolio database backups.
+    Returns list of backups with timestamps and file sizes.
+    """
+    try:
+        from services.paper_trading_service import list_portfolio_backups
+        backups = list_portfolio_backups()
+        return {
+            "backups": backups,
+            "count": len(backups),
+            "backup_directory": "portfolio_backups"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list backups: {str(e)}")
+
+
 @app.get("/midas/asset/stock_screener")
 def get_stock_screener(
-    sector: str = "all",  # "tech", "bio", "finance", "energy", "all"
+    sector: str = "universe",  # "universe", "all", "tech_sic", "energy_sic", "healthcare_sic"
     min_1m_performance: float = 10.0,
     min_3m_performance: float = 20.0,
     min_6m_performance: float = 30.0,
@@ -545,19 +618,13 @@ def get_screener_info():
     """Get information about the stock screener's universe and capabilities"""
     try:
         from services.ticker_universe_service import ticker_universe
-        from services.stock_screener_service import SECTOR_TICKERS
+        from services.stock_screener_service import SECTOR_TICKERS, get_available_sectors
         
         # Get universe stats
         universe_stats = ticker_universe.get_universe_stats()
         
-        # Get available sectors
-        available_sectors = {}
-        for sector, tickers in SECTOR_TICKERS.items():
-            available_sectors[sector] = {
-                "name": sector.title(),
-                "ticker_count": len(tickers),
-                "sample_tickers": tickers[:5]  # Show first 5 as examples
-            }
+        # Get available sectors (includes both predefined and SIC-based)
+        available_sectors = get_available_sectors()
         
         return {
             "universe": {
@@ -690,7 +757,7 @@ def get_shorts_squeeze():
 def get_historical_rankings_endpoint(
     reference_date: str = Query(..., description="Reference date in YYYY-MM-DD format"),
     top_n: int = Query(50, description="Number of top stocks to return"),
-    sector: str = Query(None, description="Optional sector filter (tech, finance, energy, bio)"),
+    sector: str = Query(None, description="Optional sector filter. Supports: 'universe', 'all', predefined sectors ('tech', 'energy', 'bio', 'finance'), or SIC-based sectors ('tech_sic', 'energy_sic', 'healthcare_sic'). Predefined sectors automatically use SIC-based data when available."),
     min_price: float = Query(None, description="Optional minimum price filter"),
     max_price: float = Query(None, description="Optional maximum price filter"),
     min_adr: float = Query(None, description="Optional minimum ADR filter"),
@@ -903,6 +970,202 @@ async def simulate_trade_endpoint(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Trade simulation failed: {str(e)}")
+
+
+@app.get("/midas/backtest/historical_rankings_range")
+def get_historical_rankings_range_endpoint(
+    sector: str = Query(..., description="Sector to analyze. REQUIRED. Supports: 'universe', 'all', predefined sectors ('tech', 'energy', 'bio', 'finance'), or SIC-based sectors ('tech_sic', 'energy_sic', 'healthcare_sic'). Predefined sectors automatically use SIC-based data when available."),
+    start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
+    end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
+    date_interval: str = Query("weekly", description="Interval between dates: 'daily', 'weekly', 'monthly'"),
+    top_n: int = Query(50, description="Number of top stocks to return per date"),
+    min_price: float = Query(None, description="Optional minimum price filter"),
+    max_price: float = Query(None, description="Optional maximum price filter"),
+    min_adr: float = Query(None, description="Optional minimum ADR filter"),
+    max_adr: float = Query(None, description="Optional maximum ADR filter"),
+    min_1m_performance: float = Query(None, description="Optional minimum 1-month performance filter (%)"),
+    max_1m_performance: float = Query(None, description="Optional maximum 1-month performance filter (%)"),
+    min_3m_performance: float = Query(None, description="Optional minimum 3-month performance filter (%)"),
+    max_3m_performance: float = Query(None, description="Optional maximum 3-month performance filter (%)"),
+    min_6m_performance: float = Query(None, description="Optional minimum 6-month performance filter (%)"),
+    max_6m_performance: float = Query(None, description="Optional maximum 6-month performance filter (%)"),
+    sort_by: str = Query("adr", description="Field to sort by (adr, rsi, performance_1m, etc.)"),
+    sort_order: str = Query("desc", description="Sort order (asc or desc)"),
+    use_sample: bool = Query(False, description="Use sampling for faster results"),
+    sample_size: int = Query(1000, description="Number of stocks to sample if use_sample=True"),
+    max_universe_size: int = Query(None, description="Maximum number of stocks to process"),
+    enable_rate_limiting: bool = Query(True, description="Enable rate limiting between API calls"),
+    max_workers: int = Query(5, description="Number of concurrent worker threads"),
+    rate_limit_per_minute: int = Query(200, description="API rate limit per minute")
+):
+    """
+    Get historical stock rankings for a date range.
+    
+    Workflow:
+    1. First, select the sector to analyze
+    2. Then, select the time range (start_date to end_date)
+    3. Optionally configure filters and optimization parameters
+    
+    Runs backtests for multiple dates between start_date and end_date.
+    Returns rankings for each date in the range.
+    """
+    try:
+        logger.info(f"📥 Received request for historical rankings range: sector={sector}, {start_date} to {end_date}, interval={date_interval}")
+        
+        # Validate date formats
+        try:
+            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
+            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        
+        # Validate date range
+        now = datetime.now()
+        if start_date_obj > now or end_date_obj > now:
+            raise HTTPException(status_code=400, detail="Dates cannot be in the future")
+        
+        if start_date_obj > end_date_obj:
+            raise HTTPException(status_code=400, detail="start_date must be before or equal to end_date")
+        
+        # Generate list of dates based on interval
+        dates = []
+        current_date = start_date_obj
+        
+        if date_interval == "daily":
+            delta = timedelta(days=1)
+        elif date_interval == "weekly":
+            delta = timedelta(weeks=1)
+        elif date_interval == "monthly":
+            # Approximate monthly (30 days)
+            delta = timedelta(days=30)
+        else:
+            raise HTTPException(status_code=400, detail="date_interval must be 'daily', 'weekly', or 'monthly'")
+        
+        while current_date <= end_date_obj:
+            dates.append(current_date.strftime("%Y-%m-%d"))
+            current_date += delta
+        
+        logger.info(f"📅 Generated {len(dates)} dates for backtesting: {dates[0]} to {dates[-1]}")
+        
+        # Prepare filters
+        filters = {}
+        if min_price is not None:
+            filters['min_price'] = min_price
+        if max_price is not None:
+            filters['max_price'] = max_price
+        if min_adr is not None:
+            filters['min_adr'] = min_adr
+        if max_adr is not None:
+            filters['max_adr'] = max_adr
+        if min_1m_performance is not None:
+            filters['min_1m_performance'] = min_1m_performance
+        if max_1m_performance is not None:
+            filters['max_1m_performance'] = max_1m_performance
+        if min_3m_performance is not None:
+            filters['min_3m_performance'] = min_3m_performance
+        if max_3m_performance is not None:
+            filters['max_3m_performance'] = max_3m_performance
+        if min_6m_performance is not None:
+            filters['min_6m_performance'] = min_6m_performance
+        if max_6m_performance is not None:
+            filters['max_6m_performance'] = max_6m_performance
+        
+        opt_params = {
+            'use_sample': use_sample,
+            'sample_size': sample_size,
+            'max_universe_size': max_universe_size,
+            'enable_rate_limiting': enable_rate_limiting,
+            'max_workers': max_workers,
+            'rate_limit_per_minute': rate_limit_per_minute
+        }
+        
+        # Run backtests for each date
+        results = []
+        total_dates = len(dates)
+        
+        for idx, ref_date in enumerate(dates, 1):
+            logger.info(f"📊 Processing date {idx}/{total_dates}: {ref_date}")
+            
+            try:
+                # Check for existing session first
+                filters_dict = {**filters}
+                if sector:
+                    filters_dict['sector'] = sector
+                if sort_by:
+                    filters_dict['sort_by'] = sort_by
+                if sort_order:
+                    filters_dict['sort_order'] = sort_order
+                
+                existing_session = find_session_by_date(ref_date, filters_dict if filters_dict else None)
+                
+                if existing_session and existing_session.get('historical_rankings'):
+                    logger.info(f"📂 Using cached rankings for {ref_date}")
+                    rankings = existing_session['historical_rankings']
+                    session_id = existing_session.get('session_id')
+                else:
+                    # Generate new rankings
+                    rankings_result = get_historical_rankings(
+                        reference_date=ref_date,
+                        top_n=top_n,
+                        sort_by=sort_by,
+                        sort_order=sort_order,
+                        sector=sector,
+                        min_price=filters.get('min_price'),
+                        max_price=filters.get('max_price'),
+                        min_adr=filters.get('min_adr'),
+                        max_adr=filters.get('max_adr'),
+                        min_1m_performance=filters.get('min_1m_performance'),
+                        max_1m_performance=filters.get('max_1m_performance'),
+                        min_3m_performance=filters.get('min_3m_performance'),
+                        max_3m_performance=filters.get('max_3m_performance'),
+                        min_6m_performance=filters.get('min_6m_performance'),
+                        max_6m_performance=filters.get('max_6m_performance'),
+                        **opt_params
+                    )
+                    
+                    if isinstance(rankings_result, dict) and 'rankings' in rankings_result:
+                        rankings = rankings_result['rankings']
+                        session_id = rankings_result.get('session_id')
+                    else:
+                        rankings = rankings_result
+                        session_id = None
+                
+                results.append({
+                    "reference_date": ref_date,
+                    "rankings": rankings,
+                    "session_id": session_id,
+                    "count": len(rankings) if isinstance(rankings, list) else 0
+                })
+                
+            except Exception as e:
+                logger.error(f"❌ Error processing date {ref_date}: {e}")
+                results.append({
+                    "reference_date": ref_date,
+                    "error": str(e),
+                    "rankings": [],
+                    "count": 0
+                })
+        
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "date_interval": date_interval,
+            "total_dates": total_dates,
+            "successful_dates": len([r for r in results if 'error' not in r]),
+            "failed_dates": len([r for r in results if 'error' in r]),
+            "results": results
+        }
+        
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"❌ Error in historical rankings range endpoint: {e}")
+        logger.error(f"Traceback: {error_trace}")
+        raise HTTPException(status_code=500, detail=f"Failed to get historical rankings range: {str(e)}")
 
 
 @app.post("/midas/backtest/run_strategy")
